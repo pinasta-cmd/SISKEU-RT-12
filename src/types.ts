@@ -1,0 +1,147 @@
+export type ResidentStatus = 'tetap' | 'kontrak' | 'pengurus';
+export type FamilyStatus = 'umum' | 'khusus';
+export type TransactionType = 'income' | 'expense';
+export type TransactionCategory =
+  | 'iuran_bulanan'
+  | 'donasi'
+  | 'kebersihan'
+  | 'keamanan'
+  | 'sosial'
+  | 'perbaikan'
+  | 'lainnya';
+export type PaymentMethod = 'transfer' | 'qris' | 'tunai';
+export type TransactionStatus = 'pending' | 'approved' | 'rejected' | 'kurang_bayar';
+export type AnnouncementCategory = 'penting' | 'keuangan' | 'kegiatan' | 'keamanan' | 'kesehatan';
+export type EmergencyType = 'medis' | 'keamanan' | 'kebakaran' | 'bencana';
+export type EmergencyStatus = 'active' | 'responding' | 'resolved';
+export type NotificationType =
+  | 'payment_approved'
+  | 'payment_rejected'
+  | 'payment_reminder'
+  | 'emergency'
+  | 'announcement';
+
+export type AppTab = 'beranda' | 'kas' | 'laporan' | 'pengumuman' | 'darurat';
+
+export interface ResidentPublic {
+  uid: string;
+  displayName: string;
+  houseBlock: string;
+  residentStatus: ResidentStatus;
+  familyStatus?: FamilyStatus;
+  familyStatusLog?: string[];
+  lastPaidMonth?: string;
+  elderlyMode: boolean;
+  communityId: string;
+  createdAt?: unknown;
+  updatedAt?: unknown;
+}
+
+export interface PrivateProfileData {
+  phone: string;
+  nikMasked: string;
+  emergencyContactName: string;
+  emergencyContactPhone: string;
+}
+
+export interface PrivateHealthData {
+  bloodType: string;
+  allergies: string;
+  chronicConditions: string;
+  medications: string;
+  insuranceProvider: string;
+  shareInEmergency: boolean;
+}
+
+export interface KasTransaction {
+  id: string;
+  type: TransactionType;
+  category: TransactionCategory;
+  title: string;
+  amount: number;
+  billingMonth: string;
+  residentUid: string;
+  residentName: string;
+  houseBlock: string;
+  familyStatus?: FamilyStatus;
+  paymentMethod: PaymentMethod;
+  proofImageData?: string;
+  status: TransactionStatus;
+  rejectionReason?: string;
+  verifiedBy?: string;
+  notes?: string;
+  communityId: string;
+  createdAt?: unknown;
+  updatedAt?: unknown;
+  isOfflinePending?: boolean;
+}
+
+export interface Announcement {
+  id: string;
+  title: string;
+  body: string;
+  category: AnnouncementCategory;
+  priority: 'normal' | 'urgent';
+  authorUid: string;
+  authorName: string;
+  communityId: string;
+  createdAt?: unknown;
+  updatedAt?: unknown;
+}
+
+export interface EmergencyAlert {
+  id: string;
+  reporterUid: string;
+  reporterName: string;
+  houseBlock: string;
+  emergencyType: EmergencyType;
+  description?: string;
+  locationText?: string;
+  medicalSummary?: string;
+  emergencyContact?: string;
+  status: EmergencyStatus;
+  responderName?: string;
+  communityId: string;
+  createdAt?: unknown;
+  updatedAt?: unknown;
+  isOfflinePending?: boolean;
+}
+
+export interface UserNotification {
+  id: string;
+  targetUid: string;
+  senderUid: string;
+  title: string;
+  message: string;
+  type: NotificationType;
+  isRead: boolean;
+  relatedId?: string;
+  createdAt?: unknown;
+}
+
+export interface RtSettings {
+  rtName: string;
+  rwName: string;
+  kelurahan: string;
+  monthlyDuesAmount: number;
+  dueDayOfMonth: number;
+  bankName?: string;
+  bankAccountNumber?: string;
+  bankAccountHolder?: string;
+  emergencyPhoneRT?: string;
+  emergencyPhoneMedical?: string;
+  updatedBy: string;
+  updatedAt?: unknown;
+}
+
+export interface BannerSlide {
+  id: string;
+  title: string;
+  subtitle: string;
+  imageData: string;
+  sortOrder: number;
+  uploadedBy: string;
+  communityId: string;
+  createdAt?: unknown;
+  updatedAt?: unknown;
+}

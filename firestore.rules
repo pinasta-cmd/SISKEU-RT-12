@@ -1,0 +1,362 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global Safety Net (Default Deny)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Core Primitives
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isOwner(userId) {
+      return isVerifiedUser() && request.auth.uid == userId;
+    }
+
+    function isBootstrappedAdmin() {
+      return isVerifiedUser() && request.auth.token.email in ['pinasta@gmail.com', 'retakanbumi@gmail.com'];
+    }
+
+    function isAdmin() {
+      return isBootstrappedAdmin() || (
+        isVerifiedUser() &&
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+      );
+    }
+
+    // Entity Validators
+    function isValidAdminRole(data) {
+      return data.keys().hasAll(['uid', 'email', 'name', 'role', 'createdAt']) &&
+        data.keys().hasOnly(['uid', 'email', 'name', 'role', 'createdAt']) &&
+        isValidId(data.uid) &&
+        data.email is string && data.email.size() >= 3 && data.email.size() <= 120 &&
+        data.name is string && data.name.size() >= 1 && data.name.size() <= 80 &&
+        data.role in ['admin', 'bendahara'] &&
+        data.createdAt is timestamp;
+    }
+
+    function isValidResidentPublic(data) {
+      return data.keys().hasAll(['uid', 'displayName', 'houseBlock', 'residentStatus', 'elderlyMode', 'communityId', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['uid', 'displayName', 'houseBlock', 'residentStatus', 'familyStatus', 'familyStatusLog', 'lastPaidMonth', 'elderlyMode', 'communityId', 'createdAt', 'updatedAt']) &&
+        isValidId(data.uid) &&
+        data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 80 &&
+        data.houseBlock is string && data.houseBlock.size() >= 1 && data.houseBlock.size() <= 30 &&
+        data.residentStatus in ['tetap', 'kontrak', 'pengurus'] &&
+        (!('familyStatus' in data) || data.familyStatus in ['umum', 'khusus']) &&
+        (!('familyStatusLog' in data) || (
+          data.familyStatusLog is list &&
+          data.familyStatusLog.size() <= 20 &&
+          (data.familyStatusLog.size() == 0 || (
+            data.familyStatusLog[0] is string &&
+            data.familyStatusLog[0].size() >= 12 &&
+            data.familyStatusLog[0].size() <= 14 &&
+            data.familyStatusLog[0].matches('^[0-9]{4}-[0-9]{2}:(umum|khusus)$')
+          ))
+        )) &&
+        (!('lastPaidMonth' in data) || (data.lastPaidMonth is string && data.lastPaidMonth.size() <= 7)) &&
+        data.elderlyMode is bool &&
+        data.communityId == 'rt_warga' &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidResidentPrivateInfo(data) {
+      return data.keys().hasAll(['uid', 'docType', 'encryptedPayload', 'encryptionAlg', 'updatedAt']) &&
+        data.keys().hasOnly(['uid', 'docType', 'encryptedPayload', 'encryptionAlg', 'shareInEmergency', 'emergencySummary', 'updatedAt']) &&
+        isValidId(data.uid) &&
+        data.docType in ['profile', 'health'] &&
+        data.encryptedPayload is string && data.encryptedPayload.size() >= 1 && data.encryptedPayload.size() <= 8000 &&
+        data.encryptionAlg == 'AES-GCM-256' &&
+        (!('shareInEmergency' in data) || data.shareInEmergency is bool) &&
+        (!('emergencySummary' in data) || (data.emergencySummary is string && data.emergencySummary.size() <= 400)) &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidKasTransaction(data) {
+      return data.keys().hasAll([
+          'type', 'category', 'title', 'amount', 'billingMonth',
+          'residentUid', 'residentName', 'houseBlock', 'paymentMethod',
+          'status', 'communityId', 'createdAt', 'updatedAt'
+        ]) &&
+        data.keys().hasOnly([
+          'type', 'category', 'title', 'amount', 'billingMonth',
+          'residentUid', 'residentName', 'houseBlock', 'familyStatus', 'paymentMethod',
+          'proofImageData', 'status', 'rejectionReason', 'verifiedBy',
+          'notes', 'communityId', 'createdAt', 'updatedAt'
+        ]) &&
+        data.type in ['income', 'expense'] &&
+        data.category in ['iuran_bulanan', 'donasi', 'kebersihan', 'keamanan', 'sosial', 'perbaikan', 'lainnya'] &&
+        data.title is string && data.title.size() >= 2 && data.title.size() <= 120 &&
+        (data.amount is int || data.amount is float) && data.amount > 0 && data.amount <= 500000000 &&
+        data.billingMonth is string && data.billingMonth.size() == 7 && data.billingMonth.matches('^[0-9]{4}-[0-9]{2}$') &&
+        isValidId(data.residentUid) &&
+        data.residentName is string && data.residentName.size() >= 1 && data.residentName.size() <= 80 &&
+        data.houseBlock is string && data.houseBlock.size() >= 1 && data.houseBlock.size() <= 30 &&
+        (!('familyStatus' in data) || data.familyStatus in ['umum', 'khusus']) &&
+        data.paymentMethod in ['transfer', 'qris', 'tunai'] &&
+        (!('proofImageData' in data) || (data.proofImageData is string && data.proofImageData.size() <= 350000)) &&
+        data.status in ['pending', 'approved', 'rejected', 'kurang_bayar'] &&
+        (!('rejectionReason' in data) || (data.rejectionReason is string && data.rejectionReason.size() <= 200)) &&
+        (!('verifiedBy' in data) || (data.verifiedBy is string && data.verifiedBy.size() <= 128)) &&
+        (!('notes' in data) || (data.notes is string && data.notes.size() <= 300)) &&
+        data.communityId == 'rt_warga' &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidAnnouncement(data) {
+      return data.keys().hasAll(['title', 'body', 'category', 'priority', 'authorUid', 'authorName', 'communityId', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['title', 'body', 'category', 'priority', 'authorUid', 'authorName', 'communityId', 'createdAt', 'updatedAt']) &&
+        data.title is string && data.title.size() >= 2 && data.title.size() <= 120 &&
+        data.body is string && data.body.size() >= 2 && data.body.size() <= 1000 &&
+        data.category in ['penting', 'keuangan', 'kegiatan', 'keamanan', 'kesehatan'] &&
+        data.priority in ['normal', 'urgent'] &&
+        isValidId(data.authorUid) &&
+        data.authorName is string && data.authorName.size() >= 1 && data.authorName.size() <= 80 &&
+        data.communityId == 'rt_warga' &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidEmergencyAlert(data) {
+      return data.keys().hasAll(['reporterUid', 'reporterName', 'houseBlock', 'emergencyType', 'status', 'communityId', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['reporterUid', 'reporterName', 'houseBlock', 'emergencyType', 'description', 'locationText', 'medicalSummary', 'emergencyContact', 'status', 'responderName', 'communityId', 'createdAt', 'updatedAt']) &&
+        isValidId(data.reporterUid) &&
+        data.reporterName is string && data.reporterName.size() >= 1 && data.reporterName.size() <= 80 &&
+        data.houseBlock is string && data.houseBlock.size() >= 1 && data.houseBlock.size() <= 30 &&
+        data.emergencyType in ['medis', 'keamanan', 'kebakaran', 'bencana'] &&
+        (!('description' in data) || (data.description is string && data.description.size() <= 400)) &&
+        (!('locationText' in data) || (data.locationText is string && data.locationText.size() <= 160)) &&
+        (!('medicalSummary' in data) || (data.medicalSummary is string && data.medicalSummary.size() <= 400)) &&
+        (!('emergencyContact' in data) || (data.emergencyContact is string && data.emergencyContact.size() <= 120)) &&
+        data.status in ['active', 'responding', 'resolved'] &&
+        (!('responderName' in data) || (data.responderName is string && data.responderName.size() <= 80)) &&
+        data.communityId == 'rt_warga' &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidUserNotification(data) {
+      return data.keys().hasAll(['targetUid', 'senderUid', 'title', 'message', 'type', 'isRead', 'createdAt']) &&
+        data.keys().hasOnly(['targetUid', 'senderUid', 'title', 'message', 'type', 'isRead', 'relatedId', 'createdAt']) &&
+        isValidId(data.targetUid) &&
+        isValidId(data.senderUid) &&
+        data.title is string && data.title.size() >= 2 && data.title.size() <= 120 &&
+        data.message is string && data.message.size() >= 2 && data.message.size() <= 400 &&
+        data.type in ['payment_approved', 'payment_rejected', 'payment_reminder', 'emergency', 'announcement'] &&
+        data.isRead is bool &&
+        (!('relatedId' in data) || (data.relatedId is string && data.relatedId.size() <= 128)) &&
+        data.createdAt is timestamp;
+    }
+
+    function isValidRtSettings(data) {
+      return data.keys().hasAll(['rtName', 'rwName', 'kelurahan', 'monthlyDuesAmount', 'dueDayOfMonth', 'updatedBy', 'updatedAt']) &&
+        data.keys().hasOnly(['rtName', 'rwName', 'kelurahan', 'monthlyDuesAmount', 'dueDayOfMonth', 'bankName', 'bankAccountNumber', 'bankAccountHolder', 'emergencyPhoneRT', 'emergencyPhoneMedical', 'updatedBy', 'updatedAt']) &&
+        data.rtName is string && data.rtName.size() >= 1 && data.rtName.size() <= 80 &&
+        data.rwName is string && data.rwName.size() >= 1 && data.rwName.size() <= 80 &&
+        data.kelurahan is string && data.kelurahan.size() >= 1 && data.kelurahan.size() <= 80 &&
+        (data.monthlyDuesAmount is int || data.monthlyDuesAmount is float) && data.monthlyDuesAmount >= 0 && data.monthlyDuesAmount <= 10000000 &&
+        data.dueDayOfMonth is int && data.dueDayOfMonth >= 1 && data.dueDayOfMonth <= 28 &&
+        (!('bankName' in data) || (data.bankName is string && data.bankName.size() <= 60)) &&
+        (!('bankAccountNumber' in data) || (data.bankAccountNumber is string && data.bankAccountNumber.size() <= 40)) &&
+        (!('bankAccountHolder' in data) || (data.bankAccountHolder is string && data.bankAccountHolder.size() <= 80)) &&
+        (!('emergencyPhoneRT' in data) || (data.emergencyPhoneRT is string && data.emergencyPhoneRT.size() <= 30)) &&
+        (!('emergencyPhoneMedical' in data) || (data.emergencyPhoneMedical is string && data.emergencyPhoneMedical.size() <= 30)) &&
+        data.updatedBy is string && data.updatedBy.size() >= 1 && data.updatedBy.size() <= 128 &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidBannerSlide(data) {
+      return data.keys().hasAll(['title', 'subtitle', 'imageData', 'sortOrder', 'uploadedBy', 'communityId', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['title', 'subtitle', 'imageData', 'sortOrder', 'uploadedBy', 'communityId', 'createdAt', 'updatedAt']) &&
+        data.title is string && data.title.size() <= 80 &&
+        data.subtitle is string && data.subtitle.size() <= 160 &&
+        data.imageData is string && data.imageData.size() >= 20 && data.imageData.size() <= 450000 &&
+        data.sortOrder is int && data.sortOrder >= 0 && data.sortOrder <= 1000 &&
+        isValidId(data.uploadedBy) &&
+        data.communityId == 'rt_warga' &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    // 1. Admins Collection
+    match /admins/{userId} {
+      allow get: if isValidId(userId) && (isOwner(userId) || isAdmin());
+      allow list: if isBootstrappedAdmin();
+      allow create, update: if isValidId(userId) && isAdmin() && isValidAdminRole(incoming()) && incoming().uid == userId && incoming().createdAt == request.time;
+      allow delete: if isValidId(userId) && isBootstrappedAdmin();
+    }
+
+    // 2. Public Community Resident Directory (No PII)
+    match /users/{userId} {
+      allow get: if isValidId(userId) && isVerifiedUser();
+      allow list: if isVerifiedUser() && resource.data.communityId == 'rt_warga';
+      allow create: if isValidId(userId) && (isOwner(userId) || isAdmin()) &&
+        isValidResidentPublic(incoming()) &&
+        incoming().uid == userId &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isValidId(userId) && isValidResidentPublic(incoming()) &&
+        incoming().uid == existing().uid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time && (
+          isAdmin() ||
+          (isOwner(userId) && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'houseBlock', 'residentStatus', 'familyStatus', 'familyStatusLog', 'elderlyMode', 'updatedAt']))
+        );
+      allow delete: if isValidId(userId) && isAdmin();
+
+      // 3. Isolated Encrypted PII & Health Profile Subcollection
+      match /private/{docId} {
+        allow get: if isValidId(userId) && isValidId(docId) && docId in ['profile', 'health'] && (isOwner(userId) || isAdmin());
+        allow list: if false;
+        allow create, update: if isValidId(userId) && isValidId(docId) && docId in ['profile', 'health'] &&
+          isOwner(userId) &&
+          isValidResidentPrivateInfo(incoming()) &&
+          incoming().uid == userId &&
+          incoming().docType == docId &&
+          incoming().updatedAt == request.time;
+        allow delete: if isValidId(userId) && isValidId(docId) && isOwner(userId);
+      }
+    }
+
+    // 4. Transparent Kas RT Transactions
+    match /transactions/{txId} {
+      allow get: if isValidId(txId) && isVerifiedUser();
+      allow list: if isVerifiedUser() && (resource.data.communityId == 'rt_warga' || resource.data.residentUid == request.auth.uid);
+      allow create: if isValidId(txId) && isVerifiedUser() && isValidKasTransaction(incoming()) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time && (
+          (isAdmin() && incoming().verifiedBy == request.auth.uid) ||
+          (
+            incoming().type == 'income' &&
+            incoming().residentUid == request.auth.uid &&
+            incoming().status == 'pending' &&
+            (!('verifiedBy' in incoming()) || incoming().verifiedBy == '') &&
+            (!('rejectionReason' in incoming()) || incoming().rejectionReason == '')
+          )
+        );
+      allow update: if isValidId(txId) && isVerifiedUser() && isValidKasTransaction(incoming()) &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().residentUid == existing().residentUid &&
+        incoming().type == existing().type && (
+          (isAdmin() && incoming().verifiedBy == request.auth.uid && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'rejectionReason', 'verifiedBy', 'notes', 'amount', 'title', 'category', 'billingMonth', 'updatedAt'])) ||
+          (
+            existing().status == 'pending' &&
+            existing().residentUid == request.auth.uid &&
+            incoming().status == 'pending' &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['proofImageData', 'notes', 'paymentMethod', 'updatedAt'])
+          )
+        );
+      allow delete: if isValidId(txId) && isAdmin();
+    }
+
+    // 5. Real-Time Neighborhood Announcements
+    match /announcements/{announcementId} {
+      allow get: if isValidId(announcementId) && isVerifiedUser();
+      allow list: if isVerifiedUser() && resource.data.communityId == 'rt_warga';
+      allow create: if isValidId(announcementId) && isAdmin() && isValidAnnouncement(incoming()) &&
+        incoming().authorUid == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isValidId(announcementId) && isAdmin() && isValidAnnouncement(incoming()) &&
+        incoming().authorUid == existing().authorUid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['title', 'body', 'category', 'priority', 'updatedAt']);
+      allow delete: if isValidId(announcementId) && isAdmin();
+    }
+
+    // 6. Real-Time One-Tap Emergency SOS Alerts
+    match /emergencies/{emergencyId} {
+      allow get: if isValidId(emergencyId) && isVerifiedUser();
+      allow list: if isVerifiedUser() && (resource.data.communityId == 'rt_warga' || resource.data.reporterUid == request.auth.uid);
+      allow create: if isValidId(emergencyId) && isVerifiedUser() && isValidEmergencyAlert(incoming()) &&
+        incoming().reporterUid == request.auth.uid &&
+        incoming().status == 'active' &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isValidId(emergencyId) && isVerifiedUser() && isValidEmergencyAlert(incoming()) &&
+        incoming().reporterUid == existing().reporterUid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time && (
+          (isAdmin() && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'responderName', 'updatedAt'])) ||
+          (
+            existing().status != 'resolved' &&
+            existing().reporterUid == request.auth.uid &&
+            incoming().status == 'resolved' &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt'])
+          )
+        );
+      allow delete: if isValidId(emergencyId) && isAdmin();
+    }
+
+    // 7. Targeted User Notifications
+    match /notifications/{notificationId} {
+      allow get: if isValidId(notificationId) && isVerifiedUser() && (existing().targetUid == request.auth.uid || isAdmin());
+      allow list: if isVerifiedUser() && resource.data.targetUid == request.auth.uid;
+      allow create: if isValidId(notificationId) && isVerifiedUser() && isValidUserNotification(incoming()) &&
+        incoming().senderUid == request.auth.uid &&
+        incoming().createdAt == request.time && (
+          isAdmin() ||
+          incoming().targetUid == request.auth.uid
+        );
+      allow update: if isValidId(notificationId) && isVerifiedUser() && isValidUserNotification(incoming()) &&
+        existing().targetUid == request.auth.uid &&
+        incoming().targetUid == existing().targetUid &&
+        incoming().senderUid == existing().senderUid &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['isRead']);
+      allow delete: if isValidId(notificationId) && isVerifiedUser() && (existing().targetUid == request.auth.uid || isAdmin());
+    }
+
+    // 8. RT Settings Configuration
+    match /settings/{settingId} {
+      allow get: if isValidId(settingId) && isVerifiedUser();
+      allow list: if false;
+      allow create, update: if isValidId(settingId) && isAdmin() && isValidRtSettings(incoming()) &&
+        incoming().updatedBy == request.auth.uid &&
+        incoming().updatedAt == request.time;
+      allow delete: if false;
+    }
+
+    // 9. Test Connection Document (Read-only startup check)
+    match /test/connection {
+      allow get: if true;
+    }
+
+    // 10. Community Banner Slideshow Photos (Public non-PII showcase, Admin-only writes)
+    match /slides/{slideId} {
+      allow get: if isValidId(slideId) && existing().communityId == 'rt_warga';
+      allow list: if resource.data.communityId == 'rt_warga';
+      allow create: if isValidId(slideId) && isAdmin() && isValidBannerSlide(incoming()) &&
+        incoming().uploadedBy == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isValidId(slideId) && isAdmin() && isValidBannerSlide(incoming()) &&
+        incoming().uploadedBy == existing().uploadedBy &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['title', 'subtitle', 'imageData', 'sortOrder', 'updatedAt']);
+      allow delete: if isValidId(slideId) && isAdmin();
+    }
+  }
+}
