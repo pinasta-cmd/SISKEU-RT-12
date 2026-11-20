@@ -432,7 +432,7 @@ export const CashflowAndDuesView: React.FC<CashflowAndDuesViewProps> = ({
 
             <div>
               <label className="block text-sm font-semibold text-slate-800 dark:text-slate-200 mb-1.5">
-                Nominal (Rp) · {selectedMonthSummary.shortfall > 0 && selectedMonthSummary.shortfall < selectedMonthSummary.tariff
+                {selectedMonthSummary.shortfall > 0 && selectedMonthSummary.shortfall < selectedMonthSummary.tariff
                   ? `Sisa Kurang ${formatRupiah(selectedMonthSummary.shortfall)}`
                   : `Tarif ${FAMILY_STATUS_LABELS[selectedMonthSummary.familyStatus]} ${formatRupiah(selectedMonthSummary.tariff)}`}
               </label>
