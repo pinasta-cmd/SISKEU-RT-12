@@ -1,4 +1,13 @@
 export type ResidentStatus = 'tetap' | 'kontrak' | 'pengurus';
+export type LoginRole = 'warga' | 'pengurus';
+export type PengurusPosition = 'ketua_rt' | 'sekretaris' | 'bendahara' | 'pengurus_lain';
+export type RbacPermission =
+  | 'manage_residents'
+  | 'manage_announcements'
+  | 'manage_kas'
+  | 'manage_reports'
+  | 'manage_emergencies'
+  | 'manage_settings';
 export type FamilyStatus = 'umum' | 'khusus';
 export type TransactionType = 'income' | 'expense';
 export type TransactionCategory =
@@ -23,8 +32,37 @@ export type NotificationType =
 
 export type AppTab = 'beranda' | 'kas' | 'laporan' | 'pengumuman' | 'darurat';
 
+export interface AdminRoleRecord {
+  uid: string;
+  email: string;
+  name: string;
+  role: 'admin' | PengurusPosition;
+  permissions?: RbacPermission[];
+  registryId?: string;
+  createdAt?: unknown;
+}
+
+export interface RbacContext {
+  isPengurus: boolean;
+  isFullAdmin: boolean;
+  position: PengurusPosition | 'warga';
+  positionLabel: string;
+  permissions: RbacPermission[];
+  canManageResidents: boolean;
+  canManageAnnouncements: boolean;
+  canManageKas: boolean;
+  canManageReports: boolean;
+  canManageEmergencies: boolean;
+  canManageSettings: boolean;
+}
+
 export interface ResidentPublic {
   uid: string;
+  username?: string;
+  accountRole?: LoginRole;
+  pengurusPosition?: PengurusPosition;
+  permissions?: RbacPermission[];
+  registryId?: string;
   displayName: string;
   houseBlock: string;
   residentStatus: ResidentStatus;
@@ -35,6 +73,31 @@ export interface ResidentPublic {
   communityId: string;
   createdAt?: unknown;
   updatedAt?: unknown;
+}
+
+export interface ResidentRegistryEntry {
+  registryId: string;
+  fullName: string;
+  houseBlock: string;
+  role: LoginRole;
+  pengurusPosition?: PengurusPosition;
+  permissions?: RbacPermission[];
+  residentStatus: ResidentStatus;
+  familyStatus: FamilyStatus;
+  claimedUid: string;
+  claimedUsername?: string;
+  communityId: string;
+  createdBy: string;
+  createdAt?: unknown;
+  updatedAt?: unknown;
+}
+
+export interface UserAccountLookup {
+  uid: string;
+  username: string;
+  role: LoginRole;
+  registryId: string;
+  createdAt?: unknown;
 }
 
 export interface PrivateProfileData {

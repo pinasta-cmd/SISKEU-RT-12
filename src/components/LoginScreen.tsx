@@ -4,21 +4,39 @@ import {
   Accessibility,
   ChevronLeft,
   ChevronRight,
+  Eye,
+  EyeOff,
   Lock,
+  LogIn,
   Moon,
   PhoneCall,
   ShieldCheck,
   Sun,
+  User,
+  UserPlus,
   WifiOff,
 } from 'lucide-react';
 import { getOfflineSnapshot } from '../lib/offlineSync';
-import type { BannerSlide } from '../types';
+import type { BannerSlide, LoginRole } from '../types';
 import { PWAInstallButton } from './PWAInstallButton';
 
 interface LoginScreenProps {
-  onLogin: () => Promise<void>;
+  onLoginWithCredentials: (data: {
+    role: LoginRole;
+    username: string;
+    password: string;
+  }) => Promise<void>;
+  onRegisterAccount: (data: {
+    role: LoginRole;
+    fullName: string;
+    houseBlock: string;
+    username: string;
+    password: string;
+  }) => Promise<void>;
+  onGoogleAdminLogin: () => Promise<void>;
   isLoggingIn: boolean;
   loginError: string | null;
+  onClearError: () => void;
   darkMode: boolean;
   onToggleDarkMode: () => void;
   elderlyMode: boolean;
@@ -36,15 +54,18 @@ interface SlideItem {
 
 const DEFAULT_FALLBACK_SLIDE: SlideItem = {
   id: 'default-rt-banner',
-  title: 'Lingkungan RT 12 / RW 20 Sukatani',
-  subtitle: 'Transparansi Kas Warga · Dokumentasi Kegiatan · Siaga Darurat Lingkungan',
+  title: 'Portal RT 12 / RW 20 Sukatani',
+  subtitle: 'Transparansi Kas Warga · Dokumentasi Kegiatan Lingkungan',
   imageData: 'src/assets/images/porseni 2026.jpeg',
 };
 
 export const LoginScreen: React.FC<LoginScreenProps> = ({
-  onLogin,
+  onLoginWithCredentials,
+  onRegisterAccount,
+  onGoogleAdminLogin,
   isLoggingIn,
   loginError,
+  onClearError,
   darkMode,
   onToggleDarkMode,
   elderlyMode,
@@ -56,8 +77,75 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
   const [failedSlideIds, setFailedSlideIds] = useState<Record<string, boolean>>({});
   const [activeIndex, setActiveIndex] = useState(0);
   const [isHovered, setIsHovered] = useState(false);
+
+  const [authMode, setAuthMode] = useState<'login' | 'register'>('login');
+  const [selectedRole, setSelectedRole] = useState<LoginRole>('warga');
+  const [fullName, setFullName] = useState('');
+  const [houseBlock, setHouseBlock] = useState('');
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
+  const [localError, setLocalError] = useState<string | null>(null);
+
   const shouldReduceMotion = useReducedMotion();
   const offlineSnapshot = getOfflineSnapshot();
+
+  const handleSwitchMode = (mode: 'login' | 'register') => {
+    setAuthMode(mode);
+    setLocalError(null);
+    onClearError();
+  };
+
+  const handleSelectRole = (role: LoginRole) => {
+    setSelectedRole(role);
+    setLocalError(null);
+    onClearError();
+  };
+
+  const handleSubmitLogin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setLocalError(null);
+    onClearError();
+    if (!username.trim() || !password) {
+      setLocalError('Masukkan username dan sandi Anda.');
+      return;
+    }
+    await onLoginWithCredentials({
+      role: selectedRole,
+      username: username.trim(),
+      password,
+    });
+  };
+
+  const handleSubmitRegister = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setLocalError(null);
+    onClearError();
+    if (!fullName.trim() || !houseBlock.trim()) {
+      setLocalError('Nama Lengkap dan Blok Rumah wajib diisi sesuai database warga.');
+      return;
+    }
+    if (!/^[a-zA-Z0-9_-]{3,30}$/.test(username.trim())) {
+      setLocalError('Username harus 3–30 karakter (huruf, angka, garis bawah _, atau tanda hubung -).');
+      return;
+    }
+    if (password.length < 6) {
+      setLocalError('Sandi minimal 6 karakter.');
+      return;
+    }
+    if (password !== confirmPassword) {
+      setLocalError('Konfirmasi sandi tidak cocok.');
+      return;
+    }
+    await onRegisterAccount({
+      role: selectedRole,
+      fullName: fullName.trim(),
+      houseBlock: houseBlock.trim(),
+      username: username.trim(),
+      password,
+    });
+  };
 
   const slides: SlideItem[] = useMemo(() => {
     if (bannerSlides.length === 0) return [DEFAULT_FALLBACK_SLIDE];
@@ -267,13 +355,65 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
 
             {/* Auth Box */}
             <div className="mt-6 rounded-2xl bg-slate-50 dark:bg-slate-950/70 border border-slate-200/80 dark:border-slate-800 p-5 space-y-4">
+              {/* Role Selector: Warga vs Pengurus */}
               <div>
-                <p className="text-sm font-bold text-slate-900 dark:text-slate-100">
-                  Autentikasi Akun Terverifikasi
+                <p className="text-xs font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400 mb-2">
+                  Pilih Role Akses
                 </p>
-                <p className="text-xs text-slate-500 dark:text-slate-400 mt-1 leading-relaxed">
-                  Masuk satu klik dengan akun Google Anda. Hak akses sebagai Warga atau Bendahara/Admin RT terdeteksi otomatis.
-                </p>
+                <div className="grid grid-cols-2 gap-2 p-1 rounded-xl bg-slate-200/70 dark:bg-slate-900 border border-slate-200 dark:border-slate-800">
+                  <button
+                    type="button"
+                    onClick={() => handleSelectRole('warga')}
+                    className={`min-h-[42px] rounded-lg text-xs sm:text-sm font-bold inline-flex items-center justify-center gap-1.5 transition-all cursor-pointer ${
+                      selectedRole === 'warga'
+                        ? 'bg-white dark:bg-slate-800 text-emerald-700 dark:text-emerald-400 shadow-xs'
+                        : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
+                    }`}
+                  >
+                    <User className="w-4 h-4 shrink-0" />
+                    <span>Warga</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleSelectRole('pengurus')}
+                    className={`min-h-[42px] rounded-lg text-xs sm:text-sm font-bold inline-flex items-center justify-center gap-1.5 transition-all cursor-pointer ${
+                      selectedRole === 'pengurus'
+                        ? 'bg-white dark:bg-slate-800 text-emerald-700 dark:text-emerald-400 shadow-xs'
+                        : 'text-slate-600 dark:text-slate-400 hover:text-slate-900 dark:hover:text-slate-200'
+                    }`}
+                  >
+                    <ShieldCheck className="w-4 h-4 shrink-0" />
+                    <span>Pengurus</span>
+                  </button>
+                </div>
+              </div>
+
+              {/* Mode Tabs: Masuk vs Daftar Akun */}
+              <div className="grid grid-cols-2 border-b border-slate-200 dark:border-slate-800">
+                <button
+                  type="button"
+                  onClick={() => handleSwitchMode('login')}
+                  className={`min-h-[40px] text-xs sm:text-sm font-bold border-b-2 transition-colors inline-flex items-center justify-center gap-1.5 cursor-pointer ${
+                    authMode === 'login'
+                      ? 'border-emerald-700 text-emerald-700 dark:text-emerald-400 dark:border-emerald-400'
+                      : 'border-transparent text-slate-500 dark:text-slate-400 hover:text-slate-800 dark:hover:text-slate-200'
+                  }`}
+                >
+                  <LogIn className="w-3.5 h-3.5" />
+                  <span>Masuk</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleSwitchMode('register')}
+                  className={`min-h-[40px] text-xs sm:text-sm font-bold border-b-2 transition-colors inline-flex items-center justify-center gap-1.5 cursor-pointer ${
+                    authMode === 'register'
+                      ? 'border-emerald-700 text-emerald-700 dark:text-emerald-400 dark:border-emerald-400'
+                      : 'border-transparent text-slate-500 dark:text-slate-400 hover:text-slate-800 dark:hover:text-slate-200'
+                  }`}
+                >
+                  <UserPlus className="w-3.5 h-3.5" />
+                  <span>Daftar Akun</span>
+                </button>
               </div>
 
               {!isOnline && (
@@ -282,53 +422,248 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
                   <div className="text-xs text-amber-900 dark:text-amber-200 leading-relaxed">
                     <p className="font-bold">Perangkat sedang offline</p>
                     <p className="mt-0.5">
-                      Masuk pertama kali membutuhkan koneksi internet. Nomor darurat &amp; kartu medis tersimpan tetap aktif di bawah.
+                      Masuk atau pendaftaran akun membutuhkan koneksi internet. Nomor darurat &amp; kartu medis tersimpan tetap aktif di bawah.
                     </p>
                   </div>
                 </div>
               )}
 
-              {loginError && (
+              {(localError || loginError) && (
                 <div
                   role="alert"
-                  className="rounded-xl bg-red-50 dark:bg-red-950/50 border border-red-200 dark:border-red-800 p-3.5 text-xs font-medium text-red-800 dark:text-red-200"
+                  className="rounded-xl bg-red-50 dark:bg-red-950/50 border border-red-200 dark:border-red-800 p-3.5 text-xs font-medium text-red-800 dark:text-red-200 leading-relaxed"
                 >
-                  {loginError}
+                  {localError || loginError}
                 </div>
               )}
 
-              <button
-                type="button"
-                onClick={() => void onLogin()}
-                disabled={isLoggingIn || !isOnline}
-                className="w-70 h-12 max-w-xs mx-auto px-4 rounded-xl bg-emerald-700 hover:bg-emerald-800 active:scale-[0.99] disabled:opacity-50 text-white font-bold text-sm flex items-center justify-center gap-3 shadow-sm transition-all cursor-pointer"              >
-                <span className="w-8 h-8 rounded-lg bg-white flex items-center justify-center shrink-0">
-                  <svg className="w-4.5 h-4.5" viewBox="0 0 24 24" aria-hidden="true">
-                    <path
-                      fill="#4285F4"
-                      d="M23.745 12.27c0-.7-.06-1.4-.19-2.07H12v4.51h6.6c-.29 1.52-1.14 2.82-2.4 3.68v3.05h3.88c2.27-2.09 3.665-5.17 3.665-9.17Z"
+              {authMode === 'login' ? (
+                <form onSubmit={(e) => void handleSubmitLogin(e)} className="space-y-3">
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1">
+                      Username ({selectedRole === 'pengurus' ? 'Pengurus' : 'Warga'})
+                    </label>
+                    <input
+                      type="text"
+                      required
+                      autoComplete="username"
+                      placeholder="Masukkan Username"
+                      value={username}
+                      onChange={(e) => setUsername(e.target.value)}
+                      className="w-full min-h-[44px] px-3.5 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm"
                     />
-                    <path
-                      fill="#34A853"
-                      d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.88-3.05c-1.08.72-2.45 1.16-4.05 1.16-3.12 0-5.77-2.11-6.72-4.96H1.29v3.14C3.26 21.3 7.31 24 12 24Z"
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1">
+                      Sandi
+                    </label>
+                    <div className="relative">
+                      <input
+                        type={showPassword ? 'text' : 'password'}
+                        required
+                        autoComplete="current-password"
+                        placeholder="Masukkan sandi Anda"
+                        value={password}
+                        onChange={(e) => setPassword(e.target.value)}
+                        className="w-full min-h-[44px] pl-3.5 pr-11 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => setShowPassword((v) => !v)}
+                        aria-label={showPassword ? 'Sembunyikan sandi' : 'Lihat sandi'}
+                        className="absolute right-1 top-1/2 -translate-y-1/2 min-h-[38px] min-w-[38px] flex items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 cursor-pointer"
+                      >
+                        {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                      </button>
+                    </div>
+                  </div>
+
+                  <button
+                    type="submit"
+                    disabled={isLoggingIn || !isOnline}
+                    className="w-full min-h-[46px] px-4 rounded-xl bg-emerald-700 hover:bg-emerald-800 active:scale-[0.99] disabled:opacity-50 text-white font-bold text-sm flex items-center justify-center gap-2 shadow-sm transition-all cursor-pointer"
+                  >
+                    <LogIn className="w-4 h-4 shrink-0" />
+                    <span>
+                      {isLoggingIn
+                        ? 'Memeriksa Akun...'
+                        : `Masuk sebagai ${selectedRole === 'pengurus' ? 'Pengurus' : 'Warga'}`}
+                    </span>
+                  </button>
+
+                  <p className="text-xs text-center text-slate-600 dark:text-slate-400 pt-1">
+                    Belum punya akun?{' '}
+                    <button
+                      type="button"
+                      onClick={() => handleSwitchMode('register')}
+                      className="font-bold text-emerald-700 dark:text-emerald-400 hover:underline cursor-pointer"
+                    >
+                      Daftar Akun Terlebih Dahulu
+                    </button>
+                  </p>
+
+                  {selectedRole === 'pengurus' && (
+                    <div className="pt-3 border-t border-slate-200/80 dark:border-slate-800 space-y-2.5">
+                      <p className="text-[11px] text-center text-slate-500 dark:text-slate-400">
+                        Atau masuk khusus Admin Utama Google untuk kelola Database Warga
+                      </p>
+                      <button
+                        type="button"
+                        onClick={() => void onGoogleAdminLogin()}
+                        disabled={isLoggingIn || !isOnline}
+                        className="w-full min-h-[42px] px-4 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 hover:bg-slate-100 dark:hover:bg-slate-800 disabled:opacity-50 text-slate-800 dark:text-slate-100 font-semibold text-xs flex items-center justify-center gap-2.5 transition-colors cursor-pointer"
+                      >
+                        <svg className="w-4 h-4 shrink-0" viewBox="0 0 24 24" aria-hidden="true">
+                          <path
+                            fill="#4285F4"
+                            d="M23.745 12.27c0-.7-.06-1.4-.19-2.07H12v4.51h6.6c-.29 1.52-1.14 2.82-2.4 3.68v3.05h3.88c2.27-2.09 3.665-5.17 3.665-9.17Z"
+                          />
+                          <path
+                            fill="#34A853"
+                            d="M12 24c3.24 0 5.95-1.08 7.93-2.91l-3.88-3.05c-1.08.72-2.45 1.16-4.05 1.16-3.12 0-5.77-2.11-6.72-4.96H1.29v3.14C3.26 21.3 7.31 24 12 24Z"
+                          />
+                          <path
+                            fill="#FBBC05"
+                            d="M5.28 14.24c-.24-.72-.38-1.49-.38-2.24s.14-1.52.38-2.24V6.62H1.29C.47 8.24 0 10.06 0 12s.47 3.76 1.29 5.38l3.99-3.14Z"
+                          />
+                          <path
+                            fill="#EA4335"
+                            d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.31 0 3.26 2.7 1.29 6.62l3.99 3.14c.95-2.85 3.6-4.96 6.72-4.96Z"
+                          />
+                        </svg>
+                        <span>Masuk Admin Google</span>
+                      </button>
+                    </div>
+                  )}
+                </form>
+              ) : (
+                <form onSubmit={(e) => void handleSubmitRegister(e)} className="space-y-3">
+                  <div className="rounded-xl bg-emerald-50/80 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-900 p-3 text-[11px] text-emerald-900 dark:text-emerald-200 leading-relaxed">
+                    Pendaftaran akun{' '}
+                    <strong>{selectedRole === 'pengurus' ? 'Pengurus' : 'Warga'}</strong>{' '}
+                    diverifikasi dengan <strong>Database Warga RT 12 / RW 20</strong>. Jika Nama Lengkap atau Blok Rumah tidak sesuai database warga, pendaftaran akan ditolak.
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1">
+                      Nama Lengkap (Sesuai Database Warga)
+                    </label>
+                    <input
+                      type="text"
+                      required
+                      maxLength={75}
+                      placeholder="Contoh: Firman Mahameru"
+                      value={fullName}
+                      onChange={(e) => setFullName(e.target.value)}
+                      className="w-full min-h-[42px] px-3.5 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm"
                     />
-                    <path
-                      fill="#FBBC05"
-                      d="M5.28 14.24c-.24-.72-.38-1.49-.38-2.24s.14-1.52.38-2.24V6.62H1.29C.47 8.24 0 10.06 0 12s.47 3.76 1.29 5.38l3.99-3.14Z"
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1">
+                      Blok Rumah
+                    </label>
+                    <input
+                      type="text"
+                      required
+                      maxLength={25}
+                      placeholder="Contoh: FF3/5"
+                      value={houseBlock}
+                      onChange={(e) => setHouseBlock(e.target.value)}
+                      className="w-full min-h-[42px] px-3.5 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm"
                     />
-                    <path
-                      fill="#EA4335"
-                      d="M12 4.75c1.77 0 3.35.61 4.6 1.8l3.42-3.42C17.95 1.19 15.24 0 12 0 7.31 0 3.26 2.7 1.29 6.62l3.99 3.14c.95-2.85 3.6-4.96 6.72-4.96Z"
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1">
+                      Username
+                    </label>
+                    <input
+                      type="text"
+                      required
+                      minLength={3}
+                      maxLength={30}
+                      autoComplete="username"
+                      placeholder="Contoh: Budi_01)"
+                      value={username}
+                      onChange={(e) => setUsername(e.target.value)}
+                      className="w-full min-h-[42px] px-3.5 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm"
                     />
-                  </svg>
-                </span>
-                <span>
-                  {isLoggingIn ? 'Menghubungkan Akun...' : 'Masuk dengan Akun Google'}
-                </span>
-              </button>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                    <div>
+                      <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1">
+                        Sandi (Min. 6 karakter)
+                      </label>
+                      <div className="relative">
+                        <input
+                          type={showPassword ? 'text' : 'password'}
+                          required
+                          minLength={6}
+                          autoComplete="new-password"
+                          placeholder="Minimal 6 karakter"
+                          value={password}
+                          onChange={(e) => setPassword(e.target.value)}
+                          className="w-full min-h-[42px] pl-3 pr-10 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => setShowPassword((v) => !v)}
+                          aria-label={showPassword ? 'Sembunyikan sandi' : 'Lihat sandi'}
+                          className="absolute right-1 top-1/2 -translate-y-1/2 min-h-[34px] min-w-[34px] flex items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 cursor-pointer"
+                        >
+                          {showPassword ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                        </button>
+                      </div>
+                    </div>
+
+                    <div>
+                      <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1">
+                        Ulangi Sandi
+                      </label>
+                      <input
+                        type={showPassword ? 'text' : 'password'}
+                        required
+                        minLength={6}
+                        autoComplete="new-password"
+                        placeholder="Ketik ulang sandi"
+                        value={confirmPassword}
+                        onChange={(e) => setConfirmPassword(e.target.value)}
+                        className="w-full min-h-[42px] px-3 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-sm"
+                      />
+                    </div>
+                  </div>
+
+                  <button
+                    type="submit"
+                    disabled={isLoggingIn || !isOnline}
+                    className="w-full min-h-[46px] px-4 rounded-xl bg-emerald-700 hover:bg-emerald-800 active:scale-[0.99] disabled:opacity-50 text-white font-bold text-sm flex items-center justify-center gap-2 shadow-sm transition-all cursor-pointer"
+                  >
+                    <UserPlus className="w-4 h-4 shrink-0" />
+                    <span>
+                      {isLoggingIn
+                        ? 'Memverifikasi Database Warga...'
+                        : `Daftarkan Akun ${selectedRole === 'pengurus' ? 'Pengurus' : 'Warga'}`}
+                    </span>
+                  </button>
+
+                  <p className="text-xs text-center text-slate-600 dark:text-slate-400 pt-1">
+                    Sudah mendaftarkan akun?{' '}
+                    <button
+                      type="button"
+                      onClick={() => handleSwitchMode('login')}
+                      className="font-bold text-emerald-700 dark:text-emerald-400 hover:underline cursor-pointer"
+                    >
+                      Masuk di Sini
+                    </button>
+                  </p>
+                </form>
+              )}
 
               <p className="text-[11px] text-center text-slate-500 dark:text-slate-400">
-                Auth 2.0 Terverifikasi Enkripsi AES-256-GCM Sinkronisasi Offline
+                Auth Terverifikasi · Enkripsi AES-256-GCM · Sinkronisasi Offline
               </p>
             </div>
 

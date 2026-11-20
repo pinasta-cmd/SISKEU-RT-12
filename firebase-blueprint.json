@@ -8,7 +8,9 @@
         "uid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
         "email": { "type": "string", "minLength": 3, "maxLength": 120 },
         "name": { "type": "string", "minLength": 1, "maxLength": 80 },
-        "role": { "type": "string", "enum": ["admin", "bendahara"] },
+        "role": { "type": "string", "enum": ["admin", "ketua_rt", "sekretaris", "bendahara", "pengurus_lain"] },
+        "permissions": { "type": "array", "description": "Explicitly granted RBAC permissions" },
+        "registryId": { "type": "string", "maxLength": 128 },
         "createdAt": { "type": "string", "format": "date-time" }
       },
       "required": ["uid", "email", "name", "role", "createdAt"]
@@ -19,6 +21,11 @@
       "type": "object",
       "properties": {
         "uid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "username": { "type": "string", "maxLength": 30 },
+        "accountRole": { "type": "string", "enum": ["warga", "pengurus"] },
+        "pengurusPosition": { "type": "string", "enum": ["ketua_rt", "sekretaris", "bendahara", "pengurus_lain"] },
+        "permissions": { "type": "array", "description": "Granted RBAC permissions for pengurus" },
+        "registryId": { "type": "string", "maxLength": 128 },
         "displayName": { "type": "string", "minLength": 1, "maxLength": 80 },
         "houseBlock": { "type": "string", "minLength": 1, "maxLength": 30 },
         "residentStatus": { "type": "string", "enum": ["tetap", "kontrak", "pengurus"] },
@@ -162,6 +169,41 @@
         "updatedAt": { "type": "string", "format": "date-time" }
       },
       "required": ["title", "subtitle", "imageData", "sortOrder", "uploadedBy", "communityId", "createdAt", "updatedAt"]
+    },
+    "ResidentRegistryEntry": {
+      "title": "ResidentRegistryEntry",
+      "description": "Master neighborhood resident database entry used to verify account registration",
+      "type": "object",
+      "properties": {
+        "registryId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "fullName": { "type": "string", "minLength": 1, "maxLength": 80 },
+        "houseBlock": { "type": "string", "minLength": 1, "maxLength": 30 },
+        "role": { "type": "string", "enum": ["warga", "pengurus"] },
+        "pengurusPosition": { "type": "string", "enum": ["ketua_rt", "sekretaris", "bendahara", "pengurus_lain"] },
+        "permissions": { "type": "array", "description": "Granted RBAC permissions for pengurus" },
+        "residentStatus": { "type": "string", "enum": ["tetap", "kontrak", "pengurus"] },
+        "familyStatus": { "type": "string", "enum": ["umum", "khusus"] },
+        "claimedUid": { "type": "string", "maxLength": 128 },
+        "claimedUsername": { "type": "string", "maxLength": 30 },
+        "communityId": { "type": "string", "minLength": 1, "maxLength": 32 },
+        "createdBy": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "updatedAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["registryId", "fullName", "houseBlock", "role", "residentStatus", "familyStatus", "claimedUid", "communityId", "createdBy", "createdAt", "updatedAt"]
+    },
+    "UserAccountLookup": {
+      "title": "UserAccountLookup",
+      "description": "Username-to-UID and role lookup table for registered neighborhood accounts",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "username": { "type": "string", "minLength": 3, "maxLength": 30, "pattern": "^[a-z0-9_\\-]+$" },
+        "role": { "type": "string", "enum": ["warga", "pengurus"] },
+        "registryId": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-zA-Z0-9_\\-]+$" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "username", "role", "registryId", "createdAt"]
     }
   },
   "firestore": {
@@ -200,6 +242,14 @@
     "/slides/{slideId}": {
       "schema": { "$ref": "#/entities/BannerSlide" },
       "description": "Public neighborhood banner slideshow photos managed by RT admins"
+    },
+    "/resident_registry/{registryId}": {
+      "schema": { "$ref": "#/entities/ResidentRegistryEntry" },
+      "description": "Master resident registry used to validate account registration before sign-in"
+    },
+    "/user_accounts/{username}": {
+      "schema": { "$ref": "#/entities/UserAccountLookup" },
+      "description": "Registered username and role lookup index"
     }
   }
 }

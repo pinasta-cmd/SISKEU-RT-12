@@ -4,7 +4,7 @@ import type { Announcement, AnnouncementCategory } from '../types';
 import { formatTimestamp } from '../utils/format';
 
 interface AnnouncementsViewProps {
-  isAdmin: boolean;
+  canManageAnnouncements: boolean;
   announcements: Announcement[];
   onPublishAnnouncement: (data: {
     title: string;
@@ -25,7 +25,7 @@ const CATEGORY_OPTIONS: { id: AnnouncementCategory | 'all'; label: string }[] = 
 ];
 
 export const AnnouncementsView: React.FC<AnnouncementsViewProps> = ({
-  isAdmin,
+  canManageAnnouncements,
   announcements,
   onPublishAnnouncement,
   onDeleteAnnouncement,
@@ -79,7 +79,7 @@ export const AnnouncementsView: React.FC<AnnouncementsViewProps> = ({
           </p>
         </div>
 
-        {isAdmin && (
+        {canManageAnnouncements && (
           <button
             type="button"
             onClick={() => setShowComposer((v) => !v)}
@@ -91,7 +91,7 @@ export const AnnouncementsView: React.FC<AnnouncementsViewProps> = ({
         )}
       </div>
 
-      {isAdmin && showComposer && (
+      {canManageAnnouncements && showComposer && (
         <form
           onSubmit={(e) => void handleSubmit(e)}
           className="rounded-3xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-6 space-y-4"
@@ -249,7 +249,7 @@ export const AnnouncementsView: React.FC<AnnouncementsViewProps> = ({
                   <span className="tabular-nums">{formatTimestamp(item.createdAt)}</span>
                 </div>
 
-                {isAdmin && (
+                {canManageAnnouncements && (
                   <button
                     type="button"
                     onClick={() => void onDeleteAnnouncement(item.id)}

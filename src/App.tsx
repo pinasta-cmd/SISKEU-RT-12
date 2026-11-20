@@ -1,14 +1,18 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  createUserWithEmailAndPassword,
   onAuthStateChanged,
+  signInWithEmailAndPassword,
   signInWithPopup,
   signOut,
+  updateProfile,
   type User,
 } from 'firebase/auth';
 import {
   addDoc,
   collection,
   deleteDoc,
+  deleteField,
   doc,
   getDoc,
   onSnapshot,
@@ -31,6 +35,7 @@ import { MobileBottomNav } from './components/MobileBottomNav';
 import { MonthlyReportView } from './components/MonthlyReportView';
 import { OnboardingTutorial } from './components/OnboardingTutorial';
 import { ProfileSettingsModal } from './components/ProfileSettingsModal';
+import { ResidentRegistryModal } from './components/ResidentRegistryModal';
 import { useOnlineStatus } from './hooks/useOnlineStatus';
 import { decryptSensitiveJson, encryptSensitiveJson } from './lib/crypto';
 import { auth, db, googleProvider, handleFirestoreError, OperationType } from './lib/firebase';
@@ -43,6 +48,7 @@ import {
   saveOfflineSnapshot,
 } from './lib/offlineSync';
 import type {
+  AdminRoleRecord,
   Announcement,
   AnnouncementCategory,
   AppTab,
@@ -51,15 +57,31 @@ import type {
   EmergencyType,
   FamilyStatus,
   KasTransaction,
+  LoginRole,
   PaymentMethod,
+  PengurusPosition,
   PrivateHealthData,
   PrivateProfileData,
+  RbacPermission,
   ResidentPublic,
+  ResidentRegistryEntry,
   ResidentStatus,
   RtSettings,
   TransactionCategory,
+  UserAccountLookup,
   UserNotification,
 } from './types';
+import {
+  computeResidentRegistryId,
+  isValidUsername,
+  normalizeUsername,
+  usernameToAuthEmail,
+} from './utils/authRegistry';
+import {
+  ALL_RBAC_PERMISSIONS,
+  normalizePengurusPermissions,
+  resolveUserRbac,
+} from './utils/rbac';
 import {
   buildUpdatedFamilyStatusLog,
   calculateResidentLedger,
@@ -131,14 +153,26 @@ export default function App() {
   const [isLoggingIn, setIsLoggingIn] = useState(false);
   const [loginError, setLoginError] = useState<string | null>(null);
 
-  const [isAdmin, setIsAdmin] = useState(false);
+  const [isBootstrappedAdminUser, setIsBootstrappedAdminUser] = useState(false);
+  const [adminRecord, setAdminRecord] = useState<AdminRoleRecord | null>(null);
   const [profile, setProfile] = useState<ResidentPublic | null>(null);
   const [privateProfile, setPrivateProfile] = useState<PrivateProfileData>(DEFAULT_PRIVATE_PROFILE);
   const [healthProfile, setHealthProfile] = useState<PrivateHealthData>(DEFAULT_HEALTH_PROFILE);
 
+  const rbac = useMemo(
+    () =>
+      resolveUserRbac({
+        isBootstrappedAdmin: isBootstrappedAdminUser,
+        adminRecord,
+        profile,
+      }),
+    [isBootstrappedAdminUser, adminRecord, profile]
+  );
+
   const [rtSettings, setRtSettings] = useState<RtSettings>(DEFAULT_RT_SETTINGS);
   const [transactions, setTransactions] = useState<KasTransaction[]>([]);
   const [residents, setResidents] = useState<ResidentPublic[]>([]);
+  const [registryEntries, setRegistryEntries] = useState<ResidentRegistryEntry[]>([]);
   const [announcements, setAnnouncements] = useState<Announcement[]>([]);
   const [emergencies, setEmergencies] = useState<EmergencyAlert[]>([]);
   const [notifications, setNotifications] = useState<UserNotification[]>([]);
@@ -149,9 +183,12 @@ export default function App() {
   const [tutorialOpen, setTutorialOpen] = useState(false);
   const [showNewUserBanner, setShowNewUserBanner] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [registryOpen, setRegistryOpen] = useState(false);
   const [liveToast, setLiveToast] = useState<{ title: string; body: string; urgent?: boolean } | null>(null);
   const [offlineQueueCount, setOfflineQueueCount] = useState<number>(() => getOfflineQueue().length);
 
+  const isRegisteringRef = useRef(false);
+  const expectedLoginRoleRef = useRef<LoginRole | null>(null);
   const initialAnnouncementIdsRef = useRef<Set<string> | null>(null);
   const initialNotificationIdsRef = useRef<Set<string> | null>(null);
   const initialEmergencyIdsRef = useRef<Set<string> | null>(null);
@@ -177,10 +214,12 @@ export default function App() {
   // Auth & Profile Bootstrap
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, async (user) => {
+      if (isRegisteringRef.current) return;
       setCurrentUser(user);
       if (!user) {
         setProfile(null);
-        setIsAdmin(false);
+        setAdminRecord(null);
+        setIsBootstrappedAdminUser(false);
         setAuthReady(true);
         return;
       }
@@ -189,28 +228,33 @@ export default function App() {
         const isBootstrapped =
           ['pinasta@gmail.com', 'retakanbumi@gmail.com'].includes(user.email || '') &&
           user.emailVerified;
-        let adminFlag = isBootstrapped;
+        let loadedAdminRecord: AdminRoleRecord | null = null;
 
         try {
           const adminDoc = await getDoc(doc(db, 'admins', user.uid));
-          if (adminDoc.exists()) adminFlag = true;
+          if (adminDoc.exists()) {
+            loadedAdminRecord = adminDoc.data() as AdminRoleRecord;
+          }
         } catch {
           // Non-admin read may be denied or offline
         }
-        setIsAdmin(adminFlag);
 
         // Bootstrap admin record and default settings if needed
         if (isBootstrapped) {
           try {
-            const existingAdmin = await getDoc(doc(db, 'admins', user.uid));
-            if (!existingAdmin.exists()) {
-              await setDoc(doc(db, 'admins', user.uid), {
+            if (!loadedAdminRecord) {
+              const bootstrapAdminDoc: AdminRoleRecord = {
                 uid: user.uid,
                 email: user.email || 'retakanbumi@gmail.com',
-                name: user.displayName || 'Pengurus RT',
-                role: 'admin',
+                name: user.displayName || 'Ketua RT',
+                role: 'ketua_rt',
+                permissions: [...ALL_RBAC_PERMISSIONS],
+              };
+              await setDoc(doc(db, 'admins', user.uid), {
+                ...bootstrapAdminDoc,
                 createdAt: serverTimestamp(),
               });
+              loadedAdminRecord = bootstrapAdminDoc;
             }
             const settingsSnap = await getDoc(doc(db, 'settings', 'rt_config'));
             if (!settingsSnap.exists()) {
@@ -225,7 +269,9 @@ export default function App() {
           }
         }
 
-        // Load or create resident directory profile
+        const adminFlag = isBootstrapped || Boolean(loadedAdminRecord);
+
+        // Load resident directory profile (never auto-provision unregistered users)
         const userRef = doc(db, 'users', user.uid);
         let userSnap;
         try {
@@ -236,16 +282,45 @@ export default function App() {
 
         if (userSnap && userSnap.exists()) {
           const data = userSnap.data() as ResidentPublic;
+          const actualRole: LoginRole = adminFlag
+            ? 'pengurus'
+            : data.accountRole || 'warga';
+
+          if (expectedLoginRoleRef.current && actualRole !== expectedLoginRoleRef.current) {
+            const expectedLabel =
+              expectedLoginRoleRef.current === 'pengurus' ? 'Pengurus' : 'Warga';
+            const actualLabel = actualRole === 'pengurus' ? 'Pengurus' : 'Warga';
+            expectedLoginRoleRef.current = null;
+            setLoginError(
+              `Role tidak sesuai. Akun ini terdaftar sebagai ${actualLabel}, bukan ${expectedLabel}.`
+            );
+            await signOut(auth);
+            setProfile(null);
+            setAdminRecord(null);
+            setIsBootstrappedAdminUser(false);
+            setAuthReady(true);
+            return;
+          }
+
+          expectedLoginRoleRef.current = null;
+          setIsBootstrappedAdminUser(isBootstrapped);
+          setAdminRecord(loadedAdminRecord);
           setProfile(data);
           if (typeof data.elderlyMode === 'boolean') {
             setElderlyMode(data.elderlyMode);
           }
-        } else {
+        } else if (isBootstrapped) {
+          expectedLoginRoleRef.current = null;
+          setIsBootstrappedAdminUser(true);
+          setAdminRecord(loadedAdminRecord);
           const initialProfile: ResidentPublic = {
             uid: user.uid,
-            displayName: user.displayName || 'Warga RT',
-            houseBlock: 'Blok A-01',
-            residentStatus: adminFlag ? 'pengurus' : 'tetap',
+            accountRole: 'pengurus',
+            pengurusPosition: 'ketua_rt',
+            permissions: [...ALL_RBAC_PERMISSIONS],
+            displayName: user.displayName || 'Ketua RT',
+            houseBlock: 'FF3/5',
+            residentStatus: 'pengurus',
             familyStatus: 'umum',
             familyStatusLog: [`${getCurrentYearMonth()}:umum`],
             elderlyMode: false,
@@ -264,6 +339,17 @@ export default function App() {
           if (!localStorage.getItem(`kaswarga_seen_intro_${user.uid}`)) {
             setShowNewUserBanner(true);
           }
+        } else {
+          expectedLoginRoleRef.current = null;
+          setLoginError(
+            'Akun Anda belum terdaftar di Database Warga. Silakan daftarkan akun terlebih dahulu menggunakan Nama Lengkap dan Blok Rumah yang sesuai.'
+          );
+          await signOut(auth);
+          setProfile(null);
+          setAdminRecord(null);
+          setIsBootstrappedAdminUser(false);
+          setAuthReady(true);
+          return;
         }
 
         // Load & decrypt isolated PII & Health Profile
@@ -316,7 +402,7 @@ export default function App() {
 
   // Real-Time Firestore Listeners
   useEffect(() => {
-    if (!authReady || !currentUser) return;
+    if (!authReady || !currentUser || !profile) return;
 
     const unsubSettings = onSnapshot(
       doc(db, 'settings', 'rt_config'),
@@ -426,7 +512,26 @@ export default function App() {
       unsubEmergencies();
       unsubNotifications();
     };
-  }, [authReady, currentUser, showToast]);
+  }, [authReady, currentUser, profile?.uid, showToast]);
+
+  // Authorized Master Resident Registry Listener (Ketua RT & Sekretaris / manage_residents)
+  useEffect(() => {
+    if (!authReady || !currentUser || !profile || !rbac.canManageResidents) {
+      setRegistryEntries([]);
+      return;
+    }
+
+    const unsubRegistry = onSnapshot(
+      query(collection(db, 'resident_registry'), where('communityId', '==', 'rt_warga')),
+      (snap) => {
+        const list = snap.docs.map((d) => d.data() as ResidentRegistryEntry);
+        setRegistryEntries(list.sort((a, b) => a.houseBlock.localeCompare(b.houseBlock)));
+      },
+      (err) => handleFirestoreError(err, OperationType.LIST, 'resident_registry')
+    );
+
+    return () => unsubRegistry();
+  }, [authReady, currentUser, profile?.uid, rbac.canManageResidents]);
 
   // Keep offline emergency snapshot up-to-date
   useEffect(() => {
@@ -498,12 +603,237 @@ export default function App() {
     void flushOfflineQueue();
   }, [flushOfflineQueue]);
 
-  const handleLogin = async () => {
+  const handleLoginWithCredentials = async (data: {
+    role: LoginRole;
+    username: string;
+    password: string;
+  }) => {
     setIsLoggingIn(true);
     setLoginError(null);
+    const normalizedUsername = normalizeUsername(data.username);
+
+    try {
+      if (!isValidUsername(normalizedUsername)) {
+        setLoginError('Format username tidak valid. Gunakan 3–30 karakter huruf, angka, _ atau -.');
+        return;
+      }
+
+      const accSnap = await getDoc(doc(db, 'user_accounts', normalizedUsername));
+      if (!accSnap.exists()) {
+        setLoginError(
+          `Username "${normalizedUsername}" belum terdaftar. Wajib mendaftarkan akun terlebih dahulu pada tab Daftar Akun.`
+        );
+        return;
+      }
+
+      const accData = accSnap.data() as UserAccountLookup;
+      if (accData.role !== data.role) {
+        setLoginError(
+          `Role tidak sesuai. Username "${normalizedUsername}" terdaftar sebagai ${
+            accData.role === 'pengurus' ? 'Pengurus' : 'Warga'
+          }.`
+        );
+        return;
+      }
+
+      expectedLoginRoleRef.current = data.role;
+      await signInWithEmailAndPassword(
+        auth,
+        usernameToAuthEmail(normalizedUsername),
+        data.password
+      );
+    } catch (err) {
+      expectedLoginRoleRef.current = null;
+      const code = (err as { code?: string })?.code || '';
+      if (
+        code === 'auth/invalid-credential' ||
+        code === 'auth/wrong-password' ||
+        code === 'auth/user-not-found'
+      ) {
+        setLoginError('Username atau sandi salah. Silakan periksa kembali.');
+      } else if (code === 'auth/operation-not-allowed') {
+        setLoginError(
+          'Metode login Email/Password belum diaktifkan di Firebase Console. Admin dapat mengaktifkannya di Authentication → Sign-in method → Email/Password.'
+        );
+      } else if (code === 'auth/too-many-requests') {
+        setLoginError('Terlalu banyak percobaan gagal. Mohon tunggu beberapa menit lalu coba lagi.');
+      } else {
+        setLoginError(
+          err instanceof Error ? `Gagal masuk: ${err.message}` : 'Gagal masuk ke sistem.'
+        );
+      }
+    } finally {
+      setIsLoggingIn(false);
+    }
+  };
+
+  const handleRegisterAccount = async (data: {
+    role: LoginRole;
+    fullName: string;
+    houseBlock: string;
+    username: string;
+    password: string;
+  }) => {
+    setIsLoggingIn(true);
+    setLoginError(null);
+
+    const normalizedUsername = normalizeUsername(data.username);
+    if (!isValidUsername(normalizedUsername)) {
+      setLoginError('Username harus 3–30 karakter (huruf kecil, angka, _ atau -).');
+      setIsLoggingIn(false);
+      return;
+    }
+
+    try {
+      const registryId = await computeResidentRegistryId(data.fullName, data.houseBlock);
+      const regRef = doc(db, 'resident_registry', registryId);
+      const regSnap = await getDoc(regRef);
+
+      if (!regSnap.exists()) {
+        setLoginError(
+          'Pendaftaran ditolak: Nama Lengkap atau Blok Rumah tidak sesuai dengan database warga RT 12 / RW 20. Hubungi Pengurus RT untuk memastikan data warga Anda terdaftar.'
+        );
+        return;
+      }
+
+      const reg = regSnap.data() as ResidentRegistryEntry;
+      if (reg.role !== data.role) {
+        setLoginError(
+          `Pendaftaran ditolak: Data warga Anda terdaftar sebagai ${
+            reg.role === 'pengurus' ? 'Pengurus' : 'Warga'
+          }, bukan ${data.role === 'pengurus' ? 'Pengurus' : 'Warga'}.`
+        );
+        return;
+      }
+
+      if (reg.claimedUid) {
+        setLoginError(
+          `Akun untuk warga ${reg.fullName} (${reg.houseBlock}) sudah terdaftar dengan username "${
+            reg.claimedUsername || '-'
+          }". Silakan langsung masuk.`
+        );
+        return;
+      }
+
+      const accRef = doc(db, 'user_accounts', normalizedUsername);
+      const accSnap = await getDoc(accRef);
+      if (accSnap.exists()) {
+        setLoginError(`Username "${normalizedUsername}" sudah digunakan. Silakan pilih username lain.`);
+        return;
+      }
+
+      isRegisteringRef.current = true;
+      const syntheticEmail = usernameToAuthEmail(normalizedUsername);
+      const cred = await createUserWithEmailAndPassword(auth, syntheticEmail, data.password);
+
+      try {
+        await updateProfile(cred.user, { displayName: reg.fullName });
+
+        const batch = writeBatch(db);
+        batch.set(accRef, {
+          uid: cred.user.uid,
+          username: normalizedUsername,
+          role: reg.role,
+          registryId,
+          createdAt: serverTimestamp(),
+        });
+
+        const regPosition: PengurusPosition = reg.pengurusPosition || 'pengurus_lain';
+        const hasExplicitRegPerms = Array.isArray(reg.permissions);
+        const newProfile: ResidentPublic = {
+          uid: cred.user.uid,
+          username: normalizedUsername,
+          accountRole: reg.role,
+          ...(reg.role === 'pengurus'
+            ? {
+                pengurusPosition: regPosition,
+                ...(hasExplicitRegPerms ? { permissions: reg.permissions } : {}),
+              }
+            : {}),
+          registryId,
+          displayName: reg.fullName,
+          houseBlock: reg.houseBlock,
+          residentStatus: reg.residentStatus || (reg.role === 'pengurus' ? 'pengurus' : 'tetap'),
+          familyStatus: reg.familyStatus || 'umum',
+          familyStatusLog: [`${getCurrentYearMonth()}:${reg.familyStatus || 'umum'}`],
+          elderlyMode: false,
+          communityId: 'rt_warga',
+        };
+
+        batch.set(doc(db, 'users', cred.user.uid), {
+          ...newProfile,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+
+        batch.update(regRef, {
+          claimedUid: cred.user.uid,
+          claimedUsername: normalizedUsername,
+          updatedAt: serverTimestamp(),
+        });
+
+        let createdAdminRecord: AdminRoleRecord | null = null;
+        if (reg.role === 'pengurus') {
+          createdAdminRecord = {
+            uid: cred.user.uid,
+            email: syntheticEmail,
+            name: reg.fullName,
+            role: regPosition,
+            ...(hasExplicitRegPerms ? { permissions: reg.permissions } : {}),
+            registryId,
+          };
+          batch.set(doc(db, 'admins', cred.user.uid), {
+            ...createdAdminRecord,
+            createdAt: serverTimestamp(),
+          });
+        }
+
+        await batch.commit();
+
+        setIsBootstrappedAdminUser(false);
+        setAdminRecord(createdAdminRecord);
+        setProfile(newProfile);
+        setCurrentUser(cred.user);
+        setAuthReady(true);
+        if (!localStorage.getItem(`kaswarga_seen_intro_${cred.user.uid}`)) {
+          setShowNewUserBanner(true);
+        }
+      } catch (batchErr) {
+        await cred.user.delete().catch(() => {});
+        await signOut(auth).catch(() => {});
+        throw batchErr;
+      } finally {
+        isRegisteringRef.current = false;
+      }
+    } catch (err) {
+      isRegisteringRef.current = false;
+      const code = (err as { code?: string })?.code || '';
+      if (code === 'auth/email-already-in-use') {
+        setLoginError(`Username "${normalizedUsername}" sudah terdaftar. Silakan gunakan username lain atau langsung masuk.`);
+      } else if (code === 'auth/weak-password') {
+        setLoginError('Sandi terlalu lemah. Gunakan minimal 6 karakter.');
+      } else if (code === 'auth/operation-not-allowed') {
+        setLoginError(
+          'Pendaftaran gagal karena Email/Password belum diaktifkan di Firebase Console (Authentication → Sign-in method → Email/Password).'
+        );
+      } else {
+        setLoginError(
+          err instanceof Error ? `Pendaftaran ditolak: ${err.message}` : 'Pendaftaran akun gagal.'
+        );
+      }
+    } finally {
+      setIsLoggingIn(false);
+    }
+  };
+
+  const handleGoogleAdminLogin = async () => {
+    setIsLoggingIn(true);
+    setLoginError(null);
+    expectedLoginRoleRef.current = 'pengurus';
     try {
       await signInWithPopup(auth, googleProvider);
     } catch (err) {
+      expectedLoginRoleRef.current = null;
       const code = (err as { code?: string })?.code || '';
       const rawMessage = err instanceof Error ? err.message : '';
       if (code === 'auth/unauthorized-domain' || rawMessage.includes('auth/unauthorized-domain')) {
@@ -533,6 +863,8 @@ export default function App() {
 
   const handleLogout = async () => {
     setSettingsOpen(false);
+    setRegistryOpen(false);
+    expectedLoginRoleRef.current = null;
     await signOut(auth);
   };
 
@@ -870,7 +1202,7 @@ export default function App() {
         status,
         updatedAt: serverTimestamp(),
       };
-      if (isAdmin && status === 'responding') {
+      if (rbac.canManageEmergencies && status === 'responding') {
         updates.responderName = profile.displayName.slice(0, 80);
       }
       await updateDoc(doc(db, 'emergencies', alert.id), updates);
@@ -1064,6 +1396,304 @@ export default function App() {
     }
   };
 
+  const handleAddRegistryEntry = async (data: {
+    fullName: string;
+    houseBlock: string;
+    role: LoginRole;
+    pengurusPosition?: PengurusPosition;
+    permissions?: RbacPermission[];
+    residentStatus: ResidentStatus;
+    familyStatus: FamilyStatus;
+  }) => {
+    if (!currentUser) return;
+    const registryId = await computeResidentRegistryId(data.fullName, data.houseBlock);
+    const ref = doc(db, 'resident_registry', registryId);
+    const existingSnap = await getDoc(ref);
+    const isPengurusEntry = data.role === 'pengurus' && rbac.isFullAdmin;
+    const effectiveRole: LoginRole = isPengurusEntry ? 'pengurus' : 'warga';
+    const pengurusPosition: PengurusPosition | undefined = isPengurusEntry
+      ? data.pengurusPosition || 'pengurus_lain'
+      : undefined;
+    const permissions: RbacPermission[] | undefined =
+      isPengurusEntry && pengurusPosition
+        ? normalizePengurusPermissions(pengurusPosition, data.permissions)
+        : undefined;
+
+    try {
+      if (existingSnap.exists()) {
+        const updatePayload: Record<string, unknown> = {
+          fullName: data.fullName.trim().slice(0, 80),
+          houseBlock: data.houseBlock.trim().slice(0, 30),
+          role: effectiveRole,
+          residentStatus: effectiveRole === 'pengurus' ? 'pengurus' : data.residentStatus,
+          familyStatus: data.familyStatus,
+          updatedAt: serverTimestamp(),
+        };
+        if (isPengurusEntry && pengurusPosition && permissions) {
+          updatePayload.pengurusPosition = pengurusPosition;
+          updatePayload.permissions = permissions;
+        } else if (rbac.isFullAdmin) {
+          updatePayload.pengurusPosition = deleteField();
+          updatePayload.permissions = deleteField();
+        }
+        await updateDoc(ref, updatePayload);
+      } else {
+        await setDoc(ref, {
+          registryId,
+          fullName: data.fullName.trim().slice(0, 80),
+          houseBlock: data.houseBlock.trim().slice(0, 30),
+          role: effectiveRole,
+          ...(isPengurusEntry && pengurusPosition && permissions
+            ? { pengurusPosition, permissions }
+            : {}),
+          residentStatus: effectiveRole === 'pengurus' ? 'pengurus' : data.residentStatus,
+          familyStatus: data.familyStatus,
+          claimedUid: '',
+          claimedUsername: '',
+          communityId: 'rt_warga',
+          createdBy: currentUser.uid,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      }
+    } catch (err) {
+      handleFirestoreError(err, OperationType.WRITE, `resident_registry/${registryId}`);
+    }
+  };
+
+  const handleBulkImportRegistry = async (
+    items: Array<{
+      fullName: string;
+      houseBlock: string;
+      role: LoginRole;
+      pengurusPosition?: PengurusPosition;
+      permissions?: RbacPermission[];
+      residentStatus: ResidentStatus;
+      familyStatus: FamilyStatus;
+    }>
+  ): Promise<number> => {
+    if (!currentUser) return 0;
+    const existingIds = new Set(registryEntries.map((e) => e.registryId));
+    let count = 0;
+    const batch = writeBatch(db);
+    for (const item of items.slice(0, 200)) {
+      const registryId = await computeResidentRegistryId(item.fullName, item.houseBlock);
+      const ref = doc(db, 'resident_registry', registryId);
+      const isPengurusEntry = item.role === 'pengurus' && rbac.isFullAdmin;
+      const effectiveRole: LoginRole = isPengurusEntry ? 'pengurus' : 'warga';
+      const pos: PengurusPosition | undefined = isPengurusEntry
+        ? item.pengurusPosition || 'pengurus_lain'
+        : undefined;
+      const perms: RbacPermission[] | undefined =
+        isPengurusEntry && pos
+          ? normalizePengurusPermissions(pos, item.permissions)
+          : undefined;
+
+      if (existingIds.has(registryId)) {
+        const updatePayload: Record<string, unknown> = {
+          fullName: item.fullName.trim().slice(0, 80),
+          houseBlock: item.houseBlock.trim().slice(0, 30),
+          role: effectiveRole,
+          residentStatus: effectiveRole === 'pengurus' ? 'pengurus' : item.residentStatus,
+          familyStatus: item.familyStatus,
+          updatedAt: serverTimestamp(),
+        };
+        if (isPengurusEntry && pos && perms) {
+          updatePayload.pengurusPosition = pos;
+          updatePayload.permissions = perms;
+        } else if (rbac.isFullAdmin) {
+          updatePayload.pengurusPosition = deleteField();
+          updatePayload.permissions = deleteField();
+        }
+        batch.update(ref, updatePayload);
+      } else {
+        existingIds.add(registryId);
+        batch.set(ref, {
+          registryId,
+          fullName: item.fullName.trim().slice(0, 80),
+          houseBlock: item.houseBlock.trim().slice(0, 30),
+          role: effectiveRole,
+          ...(isPengurusEntry && pos && perms
+            ? { pengurusPosition: pos, permissions: perms }
+            : {}),
+          residentStatus: effectiveRole === 'pengurus' ? 'pengurus' : item.residentStatus,
+          familyStatus: item.familyStatus,
+          claimedUid: '',
+          claimedUsername: '',
+          communityId: 'rt_warga',
+          createdBy: currentUser.uid,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      }
+      count++;
+    }
+    if (count > 0) {
+      await batch.commit();
+    }
+    return count;
+  };
+
+  const handleSyncExistingResidentsToRegistry = async (): Promise<number> => {
+    if (!currentUser) return 0;
+    const existingIds = new Set(registryEntries.map((e) => e.registryId));
+    const batch = writeBatch(db);
+    let added = 0;
+    for (const res of residents) {
+      const registryId = await computeResidentRegistryId(res.displayName, res.houseBlock);
+      if (existingIds.has(registryId)) continue;
+      const inferredRole: LoginRole =
+        res.accountRole || (res.residentStatus === 'pengurus' ? 'pengurus' : 'warga');
+      if (inferredRole === 'pengurus' && !rbac.isFullAdmin) continue;
+      existingIds.add(registryId);
+      const pos: PengurusPosition | undefined =
+        inferredRole === 'pengurus' ? res.pengurusPosition || 'ketua_rt' : undefined;
+      const perms: RbacPermission[] | undefined =
+        inferredRole === 'pengurus' && pos
+          ? normalizePengurusPermissions(pos, res.permissions)
+          : undefined;
+
+      batch.set(doc(db, 'resident_registry', registryId), {
+        registryId,
+        fullName: res.displayName.slice(0, 80),
+        houseBlock: res.houseBlock.slice(0, 30),
+        role: inferredRole,
+        ...(inferredRole === 'pengurus' && pos && perms
+          ? { pengurusPosition: pos, permissions: perms }
+          : {}),
+        residentStatus: res.residentStatus,
+        familyStatus: res.familyStatus || 'umum',
+        claimedUid: res.username ? res.uid : '',
+        claimedUsername: res.username || '',
+        communityId: 'rt_warga',
+        createdBy: currentUser.uid,
+        createdAt: serverTimestamp(),
+        updatedAt: serverTimestamp(),
+      });
+      added++;
+    }
+    if (added > 0) {
+      await batch.commit();
+    }
+    return added;
+  };
+
+  const handleUpdateRegistryRbac = async (
+    entry: ResidentRegistryEntry,
+    next: {
+      role: LoginRole;
+      pengurusPosition?: PengurusPosition;
+      permissions?: RbacPermission[];
+    }
+  ) => {
+    if (!rbac.isFullAdmin) return;
+    try {
+      const isPengurusNext = next.role === 'pengurus';
+      const pos: PengurusPosition = next.pengurusPosition || 'pengurus_lain';
+      const perms = isPengurusNext ? normalizePengurusPermissions(pos, next.permissions) : [];
+
+      await updateDoc(doc(db, 'resident_registry', entry.registryId), {
+        role: next.role,
+        residentStatus: isPengurusNext ? 'pengurus' : 'tetap',
+        pengurusPosition: isPengurusNext ? pos : deleteField(),
+        permissions: isPengurusNext ? perms : deleteField(),
+        updatedAt: serverTimestamp(),
+      });
+
+      if (entry.claimedUid) {
+        await updateDoc(doc(db, 'users', entry.claimedUid), {
+          residentStatus: isPengurusNext ? 'pengurus' : 'tetap',
+          accountRole: next.role,
+          pengurusPosition: isPengurusNext ? pos : deleteField(),
+          permissions: isPengurusNext ? perms : deleteField(),
+          updatedAt: serverTimestamp(),
+        });
+
+        if (entry.claimedUsername) {
+          await updateDoc(doc(db, 'user_accounts', entry.claimedUsername), {
+            role: next.role,
+          }).catch(() => {});
+        }
+
+        const adminRef = doc(db, 'admins', entry.claimedUid);
+        if (isPengurusNext) {
+          const existingAdminSnap = await getDoc(adminRef);
+          if (existingAdminSnap.exists()) {
+            await updateDoc(adminRef, {
+              name: entry.fullName.slice(0, 80),
+              role: pos,
+              permissions: perms,
+              registryId: entry.registryId,
+            });
+          } else {
+            await setDoc(adminRef, {
+              uid: entry.claimedUid,
+              email: entry.claimedUsername
+                ? usernameToAuthEmail(entry.claimedUsername)
+                : `${entry.claimedUid}@akun.siskeurt12.id`,
+              name: entry.fullName.slice(0, 80),
+              role: pos,
+              permissions: perms,
+              registryId: entry.registryId,
+              createdAt: serverTimestamp(),
+            });
+          }
+          if (entry.claimedUid === currentUser?.uid) {
+            setAdminRecord({
+              uid: entry.claimedUid,
+              email: adminRecord?.email || currentUser.email || '',
+              name: entry.fullName.slice(0, 80),
+              role: pos,
+              permissions: perms,
+              registryId: entry.registryId,
+            });
+          }
+        } else {
+          try {
+            await deleteDoc(adminRef);
+          } catch {
+            // Ignore if current user cannot delete own or non-existent admin doc
+          }
+          if (entry.claimedUid === currentUser?.uid && !isBootstrappedAdminUser) {
+            setAdminRecord(null);
+          }
+        }
+      }
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `resident_registry/${entry.registryId}`);
+    }
+  };
+
+  const handleResetRegistryClaim = async (entry: ResidentRegistryEntry) => {
+    try {
+      const batch = writeBatch(db);
+      batch.update(doc(db, 'resident_registry', entry.registryId), {
+        claimedUid: '',
+        claimedUsername: '',
+        updatedAt: serverTimestamp(),
+      });
+      if (entry.claimedUsername) {
+        batch.delete(doc(db, 'user_accounts', entry.claimedUsername));
+      }
+      await batch.commit();
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `resident_registry/${entry.registryId}`);
+    }
+  };
+
+  const handleDeleteRegistryEntry = async (entry: ResidentRegistryEntry) => {
+    try {
+      const batch = writeBatch(db);
+      batch.delete(doc(db, 'resident_registry', entry.registryId));
+      if (entry.claimedUsername) {
+        batch.delete(doc(db, 'user_accounts', entry.claimedUsername));
+      }
+      await batch.commit();
+    } catch (err) {
+      handleFirestoreError(err, OperationType.DELETE, `resident_registry/${entry.registryId}`);
+    }
+  };
+
   const handleMarkNotificationRead = async (id: string) => {
     try {
       await updateDoc(doc(db, 'notifications', id), { isRead: true });
@@ -1105,9 +1735,12 @@ export default function App() {
   if (!currentUser || !profile) {
     return (
       <LoginScreen
-        onLogin={handleLogin}
+        onLoginWithCredentials={handleLoginWithCredentials}
+        onRegisterAccount={handleRegisterAccount}
+        onGoogleAdminLogin={handleGoogleAdminLogin}
         isLoggingIn={isLoggingIn}
         loginError={loginError}
+        onClearError={() => setLoginError(null)}
         darkMode={darkMode}
         onToggleDarkMode={() => setDarkMode((d) => !d)}
         elderlyMode={elderlyMode}
@@ -1264,7 +1897,7 @@ export default function App() {
           {activeTab === 'beranda' && (
             <DashboardView
               profile={profile}
-              isAdmin={isAdmin}
+              rbac={rbac}
               rtSettings={rtSettings}
               transactions={mergedTransactions}
               residents={residents}
@@ -1283,7 +1916,7 @@ export default function App() {
             <CashflowAndDuesView
               profile={profile}
               residents={residents}
-              isAdmin={isAdmin}
+              canManageKas={rbac.canManageKas}
               isOnline={isOnline}
               rtSettings={rtSettings}
               transactions={mergedTransactions}
@@ -1297,17 +1930,19 @@ export default function App() {
 
           {activeTab === 'laporan' && (
             <MonthlyReportView
-              isAdmin={isAdmin}
+              canManageReports={rbac.canManageReports}
+              canManageResidents={rbac.canManageResidents}
               rtSettings={rtSettings}
               transactions={mergedTransactions}
               residents={residents}
               onSendPaymentReminders={handleSendPaymentReminders}
+              onOpenResidentRegistry={() => setRegistryOpen(true)}
             />
           )}
 
           {activeTab === 'pengumuman' && (
             <AnnouncementsView
-              isAdmin={isAdmin}
+              canManageAnnouncements={rbac.canManageAnnouncements}
               announcements={announcements}
               onPublishAnnouncement={handlePublishAnnouncement}
               onDeleteAnnouncement={handleDeleteAnnouncement}
@@ -1317,7 +1952,7 @@ export default function App() {
           {activeTab === 'darurat' && (
             <EmergencyAndHealthView
               profile={profile}
-              isAdmin={isAdmin}
+              canManageEmergencies={rbac.canManageEmergencies}
               isOnline={isOnline}
               rtSettings={rtSettings}
               emergencies={mergedEmergencies}
@@ -1351,7 +1986,7 @@ export default function App() {
         onClose={() => setSettingsOpen(false)}
         profile={profile}
         userEmail={currentUser.email || ''}
-        isAdmin={isAdmin}
+        rbac={rbac}
         darkMode={darkMode}
         onToggleDarkMode={() => setDarkMode((d) => !d)}
         elderlyMode={elderlyMode}
@@ -1359,6 +1994,8 @@ export default function App() {
         rtSettings={rtSettings}
         transactions={mergedTransactions}
         bannerSlides={bannerSlides}
+        registryCount={registryEntries.length}
+        onOpenResidentRegistry={() => setRegistryOpen(true)}
         onSaveProfile={handleSaveProfile}
         onSaveRtSettings={handleSaveRtSettings}
         onAddBannerSlide={handleAddBannerSlide}
@@ -1368,6 +2005,23 @@ export default function App() {
         onOpenTutorial={() => setTutorialOpen(true)}
         onLogout={handleLogout}
       />
+
+      {rbac.canManageResidents && (
+        <ResidentRegistryModal
+          isOpen={registryOpen}
+          onClose={() => setRegistryOpen(false)}
+          canManageRbac={rbac.isFullAdmin}
+          currentUserUid={currentUser.uid}
+          registryEntries={registryEntries}
+          existingResidents={residents}
+          onAddEntry={handleAddRegistryEntry}
+          onBulkImport={handleBulkImportRegistry}
+          onSyncExistingResidents={handleSyncExistingResidentsToRegistry}
+          onUpdateRbac={handleUpdateRegistryRbac}
+          onResetClaim={handleResetRegistryClaim}
+          onDeleteEntry={handleDeleteRegistryEntry}
+        />
+      )}
     </div>
   );
 }

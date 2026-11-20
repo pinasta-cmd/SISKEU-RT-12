@@ -1,11 +1,13 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
   AlertTriangle,
   ArrowDownLeft,
   ArrowUpRight,
   BookOpen,
+  CalendarDays,
   Check,
   CheckCircle2,
+  ChevronLeft,
   ChevronRight,
   Clock,
   Copy,
@@ -13,6 +15,8 @@ import {
   HeartPulse,
   Megaphone,
   ShieldAlert,
+  ShieldCheck,
+  UserCheck,
   Wallet,
 } from 'lucide-react';
 import type {
@@ -20,6 +24,7 @@ import type {
   AppTab,
   EmergencyAlert,
   KasTransaction,
+  RbacContext,
   ResidentPublic,
   RtSettings,
 } from '../types';
@@ -36,7 +41,7 @@ import {
 
 interface DashboardViewProps {
   profile: ResidentPublic;
-  isAdmin: boolean;
+  rbac: RbacContext;
   rtSettings: RtSettings;
   transactions: KasTransaction[];
   residents: ResidentPublic[];
@@ -49,7 +54,7 @@ interface DashboardViewProps {
 
 export const DashboardView: React.FC<DashboardViewProps> = ({
   profile,
-  isAdmin,
+  rbac,
   rtSettings,
   transactions,
   residents,
@@ -60,20 +65,77 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
   onQuickPayDues,
 }) => {
   const [copiedBank, setCopiedBank] = useState(false);
+  const [now, setNow] = useState<Date>(() => new Date());
+  const [calendarCursor, setCalendarCursor] = useState<{ year: number; month: number }>(() => {
+    const initial = new Date();
+    return { year: initial.getFullYear(), month: initial.getMonth() };
+  });
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      setNow(new Date());
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  const isPengurus = rbac.isPengurus;
+  const loginRoleLabel = rbac.positionLabel;
 
   const currentMonth = getCurrentYearMonth();
   const approvedTx = transactions.filter(
     (t) => t.status === 'approved' || t.status === 'kurang_bayar'
   );
-  const totalIncome = approvedTx
+  const allApprovedIncome = approvedTx
     .filter((t) => t.type === 'income')
     .reduce((sum, t) => sum + Number(t.amount || 0), 0);
-  const totalExpense = approvedTx
+  const allApprovedExpense = approvedTx
     .filter((t) => t.type === 'expense')
     .reduce((sum, t) => sum + Number(t.amount || 0), 0);
-  const netBalance = totalIncome - totalExpense;
+  const netBalance = allApprovedIncome - allApprovedExpense;
+
+  // Pemasukan, Iuran Bulanan, dan Pengeluaran khusus bulan berjalan
+  const currentMonthApprovedTx = approvedTx.filter(
+    (t) => t.billingMonth === currentMonth
+  );
+  const totalMonthlyDues = currentMonthApprovedTx
+    .filter((t) => t.type === 'income' && t.category === 'iuran_bulanan')
+    .reduce((sum, t) => sum + Number(t.amount || 0), 0);
+  const totalIncome = currentMonthApprovedTx
+    .filter((t) => t.type === 'income' && t.category !== 'iuran_bulanan')
+    .reduce((sum, t) => sum + Number(t.amount || 0), 0);
+  const totalExpense = currentMonthApprovedTx
+    .filter((t) => t.type === 'expense')
+    .reduce((sum, t) => sum + Number(t.amount || 0), 0);
 
   const pendingVerificationCount = transactions.filter((t) => t.status === 'pending').length;
+
+  const formattedTodayDate = now.toLocaleDateString('id-ID', {
+    weekday: 'long',
+    day: 'numeric',
+    month: 'long',
+    year: 'numeric',
+  });
+  const formattedTodayTime = now.toLocaleTimeString('id-ID', {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+  });
+
+  const calendarMonthDate = new Date(calendarCursor.year, calendarCursor.month, 1);
+  const calendarMonthLabel = calendarMonthDate.toLocaleDateString('id-ID', {
+    month: 'long',
+    year: 'numeric',
+  });
+  const leadingEmptyDays = (calendarMonthDate.getDay() + 6) % 7;
+  const daysInCalendarMonth = new Date(
+    calendarCursor.year,
+    calendarCursor.month + 1,
+    0
+  ).getDate();
+  const isViewingCurrentMonth =
+    calendarCursor.year === now.getFullYear() &&
+    calendarCursor.month === now.getMonth();
 
   const myDuesSummary = getResidentMonthDuesSummary(profile, transactions, currentMonth);
   const myFamilyLabel = FAMILY_STATUS_LABELS[myDuesSummary.familyStatus];
@@ -105,8 +167,50 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
     }
   };
 
+  const handlePrevCalendarMonth = () => {
+    setCalendarCursor((prev) =>
+      prev.month === 0
+        ? { year: prev.year - 1, month: 11 }
+        : { year: prev.year, month: prev.month - 1 }
+    );
+  };
+
+  const handleNextCalendarMonth = () => {
+    setCalendarCursor((prev) =>
+      prev.month === 11
+        ? { year: prev.year + 1, month: 0 }
+        : { year: prev.year, month: prev.month + 1 }
+    );
+  };
+
+  const handleResetCalendarToday = () => {
+    const today = new Date();
+    setCalendarCursor({ year: today.getFullYear(), month: today.getMonth() });
+  };
+
   return (
     <div className="space-y-6">
+      {/* Top Account Role + Today Date & Live Clock Strip */}
+      <div className="rounded-2xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 px-5 py-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+        <div className="flex flex-wrap items-center gap-2.5">
+
+          <span className="text-sm font-semibold text-slate-900 dark:text-slate-100">
+            {rtSettings.rtName}/{rtSettings.rwName} · {rtSettings.kelurahan}
+          </span>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-3 text-xs sm:text-sm">
+          <div className="inline-flex items-center gap-1.5 font-semibold text-slate-700 dark:text-slate-200">
+            <CalendarDays className="w-4 h-4 text-emerald-700 dark:text-emerald-400 shrink-0" />
+            <span className="capitalize">{formattedTodayDate}</span>
+          </div>
+          <div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-100 dark:bg-slate-800 font-mono-num text-xs font-bold text-slate-900 dark:text-slate-100 tabular-nums">
+            <Clock className="w-3.5 h-3.5 text-emerald-700 dark:text-emerald-400 shrink-0" />
+            <span>{formattedTodayTime}</span>
+          </div>
+        </div>
+      </div>
+
       {/* Active Emergency Banner if any */}
       {activeEmergencies.length > 0 && (
         <div className="rounded-2xl bg-red-600 text-white p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4 shadow-sm">
@@ -140,9 +244,6 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
         <section className="lg:col-span-7 relative overflow-hidden rounded-3xl bg-gradient-to-br from-emerald-900 via-emerald-800 to-teal-900 dark:from-emerald-950 dark:via-emerald-900 dark:to-slate-900 text-white p-6 sm:p-7 flex flex-col justify-between border border-emerald-700/70 dark:border-emerald-800">
           <div className="flex items-start justify-between gap-4">
             <div className="min-w-0">
-              <p className="text-xs font-semibold text-emerald-200/90">
-                {rtSettings.rtName} · {rtSettings.rwName} · {rtSettings.kelurahan}
-              </p>
               <p className="mt-4 text-sm font-medium text-emerald-100">Total Saldo Kas RT</p>
               <p className="mt-1 font-mono-num text-3xl sm:text-[2.5rem] font-extrabold tracking-tight leading-none tabular-nums">
                 {formatRupiah(netBalance)}
@@ -184,11 +285,22 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             </div>
           </div>
 
-          <div className="mt-8 pt-5 border-t border-white/15 grid grid-cols-2 sm:grid-cols-3 gap-4">
+          <div className="mt-8 pt-5 border-t border-white/15">
+            <span className="block mb-3 text-sm font-semibold text-white">Total:</span>
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+            <div>
+              <div className="flex items-center gap-1.5 text-xs text-emerald-200">
+                <Wallet className="w-3.5 h-3.5 shrink-0" />
+                <span>Iuran Bulan Ini</span>
+              </div>
+              <p className="mt-1 font-mono-num text-base sm:text-lg font-bold tabular-nums">
+                {formatRupiah(totalMonthlyDues)}
+              </p>
+            </div>
             <div>
               <div className="flex items-center gap-1.5 text-xs text-emerald-200">
                 <ArrowDownLeft className="w-3.5 h-3.5 shrink-0" />
-                <span>Total Pemasukan</span>
+                <span>Pemasukan Lain</span>
               </div>
               <p className="mt-1 font-mono-num text-base sm:text-lg font-bold tabular-nums">
                 {formatRupiah(totalIncome)}
@@ -197,17 +309,18 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
             <div>
               <div className="flex items-center gap-1.5 text-xs text-emerald-200">
                 <ArrowUpRight className="w-3.5 h-3.5 shrink-0" />
-                <span>Total Pengeluaran</span>
+                <span>Pengeluaran</span>
               </div>
               <p className="mt-1 font-mono-num text-base sm:text-lg font-bold tabular-nums">
                 {formatRupiah(totalExpense)}
               </p>
             </div>
-            <div className="col-span-2 sm:col-span-1">
-              <p className="text-xs text-emerald-200">Partisipasi {formatMonthLabel(currentMonth)}</p>
+            <div>
+              <p className="text-xs text-emerald-200">Partisipasi</p>
               <p className="mt-1 font-mono-num text-base sm:text-lg font-bold tabular-nums">
-                {paidResidentsCount}/{totalResidentsCount} rumah
+                {paidResidentsCount}/{totalResidentsCount} KK
               </p>
+            </div>
             </div>
           </div>
         </section>
@@ -219,12 +332,30 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               <span className="font-semibold">
                 Iuran {formatMonthLabel(currentMonth)}
               </span>
-              <span className="font-medium">{myFamilyLabel}</span>
+              <span className="font-medium">
+                {myFamilyLabel}
+              </span>
             </div>
-            <h2 className="mt-1.5 text-xl font-extrabold text-slate-900 dark:text-slate-100 tracking-tight">
-              {profile.displayName} 
-            </h2>
-            <div className="flex items-center justify-between gap-2 text-xs text-slate-500 dark:text-slate-400">
+            <div className="mt-1.5 flex items-center justify-between gap-3">
+              <h2 className="text-xl font-extrabold text-slate-900 dark:text-slate-100 tracking-tight min-w-0 truncate">
+                {profile.displayName}
+              </h2>
+              <span
+                className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold border shrink-0 ${
+                  isPengurus
+                    ? 'bg-emerald-50 dark:bg-emerald-950/60 text-emerald-800 dark:text-emerald-300 border-emerald-200 dark:border-emerald-800'
+                    : 'bg-sky-50 dark:bg-sky-950/60 text-sky-800 dark:text-sky-300 border-sky-200 dark:border-sky-800'
+                }`}
+              >
+                {isPengurus ? (
+                  <ShieldCheck className="w-3.5 h-3.5 shrink-0" />
+                ) : (
+                  <UserCheck className="w-3.5 h-3.5 shrink-0" />
+                )}
+                <span>{loginRoleLabel}</span>
+              </span>
+            </div>
+            <div className="mt-0.5 flex items-center justify-between gap-2 text-xs text-slate-500 dark:text-slate-400">
               <span className="font-medium">{profile.houseBlock}</span>
             </div>
 
@@ -287,9 +418,11 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                   </span>
                 </div>
                 <p className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed">
-                  Jatuh tempo setiap tanggal {rtSettings.dueDayOfMonth}. Transfer ke{' '}
+                  Jatuh tempo setiap tanggal {rtSettings.dueDayOfMonth} 
+                  <br />
+                  Transfer ke{' '}
                   <span className="font-semibold text-slate-900 dark:text-slate-100">
-                    {rtSettings.bankName || 'Kas RT'} {rtSettings.bankAccountNumber || ''}
+                    {rtSettings.bankName || 'Kas RT'} {rtSettings.bankAccountNumber || ''} an. {rtSettings.bankAccountHolder}
                   </span>
                 </p>
                 {rtSettings.bankAccountNumber && (
@@ -306,7 +439,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
                     ) : (
                       <>
                         <Copy className="w-3.5 h-3.5" />
-                        <span>Salin No. Rekening RT</span>
+                        <span>Salin No. Rekening</span>
                       </>
                     )}
                   </button>
@@ -348,7 +481,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           <h2 className="text-base font-bold text-slate-900 dark:text-slate-100">
             Menu Cepat Warga
           </h2>
-          {isAdmin && pendingVerificationCount > 0 && (
+          {rbac.canManageKas && pendingVerificationCount > 0 && (
             <button
               type="button"
               onClick={() => onNavigate('kas')}
@@ -522,57 +655,159 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
           </div>
         </section>
 
-        <section className="lg:col-span-5 rounded-3xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 overflow-hidden">
-          <div className="px-6 py-4 border-b border-slate-100 dark:border-slate-800 flex items-center justify-between">
-            <h2 className="text-base font-bold text-slate-900 dark:text-slate-100 flex items-center gap-2">
-              <Megaphone className="w-4 h-4 text-emerald-700 dark:text-emerald-400 shrink-0" />
-              <span>Pengumuman Lingkungan</span>
-            </h2>
-            <button
-              type="button"
-              onClick={() => onNavigate('pengumuman')}
-              className="text-xs font-semibold text-emerald-700 dark:text-emerald-400 hover:underline min-h-[36px] inline-flex items-center gap-1 cursor-pointer"
-            >
-              <span>Semua Kabar</span>
-              <ChevronRight className="w-3.5 h-3.5" />
-            </button>
-          </div>
-          <div className="divide-y divide-slate-100 dark:divide-slate-800">
-            {latestAnnouncements.length === 0 ? (
-              <p className="p-8 text-center text-sm text-slate-500 dark:text-slate-400">
-                Belum ada pengumuman terbaru dari pengurus RT.
-              </p>
-            ) : (
-              latestAnnouncements.map((item) => (
+        <div className="lg:col-span-5 space-y-6">
+          {/* Today's Calendar & Live Time Card */}
+          <section
+            aria-label="Kalender dan Waktu Hari Ini"
+            className="rounded-3xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 overflow-hidden"
+          >
+            <div className="px-6 py-4 border-b border-slate-100 dark:border-slate-800 flex items-center justify-between gap-3">
+              <div>
+                <h2 className="text-base font-bold text-slate-900 dark:text-slate-100 flex items-center gap-2">
+                  <CalendarDays className="w-4 h-4 text-emerald-700 dark:text-emerald-400 shrink-0" />
+                  <span>Kalender & Waktu</span>
+                </h2>
+                <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5 capitalize">
+                  {formattedTodayDate} · <span className="font-mono-num font-semibold">{formattedTodayTime}</span>
+                </p>
+              </div>
+              <div className="flex items-center gap-1">
+                {!isViewingCurrentMonth && (
+                  <button
+                    type="button"
+                    onClick={handleResetCalendarToday}
+                    className="min-h-[32px] px-2.5 rounded-lg text-[11px] font-bold text-emerald-700 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-950/50 hover:bg-emerald-100 dark:hover:bg-emerald-900/50 transition-colors cursor-pointer"
+                  >
+                    Hari Ini
+                  </button>
+                )}
                 <button
-                  key={item.id}
                   type="button"
-                  onClick={() => onNavigate('pengumuman')}
-                  className="w-full text-left px-6 py-4 hover:bg-slate-50/80 dark:hover:bg-slate-800/40 transition-colors cursor-pointer"
+                  onClick={handlePrevCalendarMonth}
+                  aria-label="Bulan sebelumnya"
+                  className="min-h-[34px] min-w-[34px] flex items-center justify-center rounded-lg text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors cursor-pointer"
                 >
-                  <div className="flex items-center justify-between gap-2 text-xs text-slate-500 dark:text-slate-400">
-                    <span
-                      className={
-                        item.priority === 'urgent'
-                          ? 'font-bold text-red-600 dark:text-red-400'
-                          : 'font-semibold text-emerald-700 dark:text-emerald-400'
-                      }
-                    >
-                      {item.priority === 'urgent' ? 'Mendesak' : 'Info Warga'} · {item.category}
-                    </span>
-                    <span className="tabular-nums">{formatTimestamp(item.createdAt)}</span>
-                  </div>
-                  <p className="mt-1.5 text-sm font-bold text-slate-900 dark:text-slate-100">
-                    {item.title}
-                  </p>
-                  <p className="mt-1 text-xs text-slate-600 dark:text-slate-300 line-clamp-2 leading-relaxed">
-                    {item.body}
-                  </p>
+                  <ChevronLeft className="w-4 h-4" />
                 </button>
-              ))
-            )}
-          </div>
-        </section>
+                <button
+                  type="button"
+                  onClick={handleNextCalendarMonth}
+                  aria-label="Bulan berikutnya"
+                  className="min-h-[34px] min-w-[34px] flex items-center justify-center rounded-lg text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors cursor-pointer"
+                >
+                  <ChevronRight className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+
+            <div className="p-5">
+              <p className="text-xs font-bold text-slate-700 dark:text-slate-200 capitalize mb-3">
+                {calendarMonthLabel}
+              </p>
+              <div className="grid grid-cols-7 gap-1 text-center text-[11px] font-semibold text-slate-400 dark:text-slate-500 mb-1.5">
+                {['Sen', 'Sel', 'Rab', 'Kam', 'Jum', 'Sab', 'Min'].map((day) => (
+                  <div key={day} className="py-1">
+                    {day}
+                  </div>
+                ))}
+              </div>
+              <div className="grid grid-cols-7 gap-1 text-center text-xs">
+                {Array.from({ length: leadingEmptyDays }).map((_, idx) => (
+                  <div key={`empty-${idx}`} className="h-8" />
+                ))}
+                {Array.from({ length: daysInCalendarMonth }).map((_, idx) => {
+                  const dayNum = idx + 1;
+                  const isToday =
+                    isViewingCurrentMonth && dayNum === now.getDate();
+                  const isDueDay = dayNum === rtSettings.dueDayOfMonth;
+                  return (
+                    <div
+                      key={dayNum}
+                      title={
+                        isToday
+                          ? 'Hari Ini'
+                          : isDueDay
+                          ? `Jatuh tempo iuran RT (tgl ${rtSettings.dueDayOfMonth})`
+                          : undefined
+                      }
+                      className={`h-8 rounded-lg flex flex-col items-center justify-center font-mono-num tabular-nums relative ${
+                        isToday
+                          ? 'bg-emerald-700 text-white font-extrabold shadow-xs'
+                          : isDueDay
+                          ? 'bg-amber-50 dark:bg-amber-950/50 text-amber-800 dark:text-amber-300 font-bold border border-amber-200 dark:border-amber-800/70'
+                          : 'text-slate-700 dark:text-slate-300 font-medium'
+                      }`}
+                    >
+                      <span>{dayNum}</span>
+                    </div>
+                  );
+                })}
+              </div>
+              <div className="mt-3 pt-3 border-t border-slate-100 dark:border-slate-800 flex items-center justify-between text-[11px] text-slate-500 dark:text-slate-400">
+                <span className="inline-flex items-center gap-1.5">
+                  <span className="w-2.5 h-2.5 rounded-xs bg-emerald-700 inline-block" />
+                  Hari ini
+                </span>
+                <span className="inline-flex items-center gap-1.5">
+                  <span className="w-2.5 h-2.5 rounded-xs bg-amber-200 dark:bg-amber-800 inline-block" />
+                  Jatuh tempo
+                </span>
+              </div>
+            </div>
+          </section>
+
+          <section className="rounded-3xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 overflow-hidden">
+            <div className="px-6 py-4 border-b border-slate-100 dark:border-slate-800 flex items-center justify-between">
+              <h2 className="text-base font-bold text-slate-900 dark:text-slate-100 flex items-center gap-2">
+                <Megaphone className="w-4 h-4 text-emerald-700 dark:text-emerald-400 shrink-0" />
+                <span>Pengumuman Lingkungan</span>
+              </h2>
+              <button
+                type="button"
+                onClick={() => onNavigate('pengumuman')}
+                className="text-xs font-semibold text-emerald-700 dark:text-emerald-400 hover:underline min-h-[36px] inline-flex items-center gap-1 cursor-pointer"
+              >
+                <span>Semua Kabar</span>
+                <ChevronRight className="w-3.5 h-3.5" />
+              </button>
+            </div>
+            <div className="divide-y divide-slate-100 dark:divide-slate-800">
+              {latestAnnouncements.length === 0 ? (
+                <p className="p-8 text-center text-sm text-slate-500 dark:text-slate-400">
+                  Belum ada pengumuman terbaru dari pengurus RT.
+                </p>
+              ) : (
+                latestAnnouncements.map((item) => (
+                  <button
+                    key={item.id}
+                    type="button"
+                    onClick={() => onNavigate('pengumuman')}
+                    className="w-full text-left px-6 py-4 hover:bg-slate-50/80 dark:hover:bg-slate-800/40 transition-colors cursor-pointer"
+                  >
+                    <div className="flex items-center justify-between gap-2 text-xs text-slate-500 dark:text-slate-400">
+                      <span
+                        className={
+                          item.priority === 'urgent'
+                            ? 'font-bold text-red-600 dark:text-red-400'
+                            : 'font-semibold text-emerald-700 dark:text-emerald-400'
+                        }
+                      >
+                        {item.priority === 'urgent' ? 'Mendesak' : 'Info Warga'} · {item.category}
+                      </span>
+                      <span className="tabular-nums">{formatTimestamp(item.createdAt)}</span>
+                    </div>
+                    <p className="mt-1.5 text-sm font-bold text-slate-900 dark:text-slate-100">
+                      {item.title}
+                    </p>
+                    <p className="mt-1 text-xs text-slate-600 dark:text-slate-300 line-clamp-2 leading-relaxed">
+                      {item.body}
+                    </p>
+                  </button>
+                ))
+              )}
+            </div>
+          </section>
+        </div>
       </div>
     </div>
   );

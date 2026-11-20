@@ -22,7 +22,7 @@ import { formatTimestamp } from '../utils/format';
 
 interface EmergencyAndHealthViewProps {
   profile: ResidentPublic;
-  isAdmin: boolean;
+  canManageEmergencies: boolean;
   isOnline: boolean;
   rtSettings: RtSettings;
   emergencies: EmergencyAlert[];
@@ -56,7 +56,7 @@ const EMERGENCY_TYPES: {
 
 export const EmergencyAndHealthView: React.FC<EmergencyAndHealthViewProps> = ({
   profile,
-  isAdmin,
+  canManageEmergencies,
   isOnline,
   rtSettings,
   emergencies,
@@ -357,7 +357,7 @@ export const EmergencyAndHealthView: React.FC<EmergencyAndHealthViewProps> = ({
 
                     {alert.status !== 'resolved' && !alert.isOfflinePending && (
                       <div className="pt-2 flex flex-wrap gap-2">
-                        {isAdmin && alert.status === 'active' && (
+                        {canManageEmergencies && alert.status === 'active' && (
                           <button
                             type="button"
                             onClick={() => void onUpdateEmergencyStatus(alert, 'responding')}
@@ -366,7 +366,7 @@ export const EmergencyAndHealthView: React.FC<EmergencyAndHealthViewProps> = ({
                             Tandai Sedang Ditangani
                           </button>
                         )}
-                        {(isAdmin || alert.reporterUid === profile.uid) && (
+                        {(canManageEmergencies || alert.reporterUid === profile.uid) && (
                           <button
                             type="button"
                             onClick={() => void onUpdateEmergencyStatus(alert, 'resolved')}

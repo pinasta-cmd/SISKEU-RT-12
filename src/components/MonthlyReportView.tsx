@@ -4,6 +4,7 @@ import {
   ArrowUpRight,
   BellRing,
   CheckCircle2,
+  Database,
   Download,
   Printer,
   Search,
@@ -22,19 +23,23 @@ import {
 } from '../utils/format';
 
 interface MonthlyReportViewProps {
-  isAdmin: boolean;
+  canManageReports: boolean;
+  canManageResidents: boolean;
   rtSettings: RtSettings;
   transactions: KasTransaction[];
   residents: ResidentPublic[];
   onSendPaymentReminders: (unpaidResidents: ResidentPublic[], yearMonth: string) => Promise<number>;
+  onOpenResidentRegistry?: () => void;
 }
 
 export const MonthlyReportView: React.FC<MonthlyReportViewProps> = ({
-  isAdmin,
+  canManageReports,
+  canManageResidents,
   rtSettings,
   transactions,
   residents,
   onSendPaymentReminders,
+  onOpenResidentRegistry,
 }) => {
   const [selectedMonth, setSelectedMonth] = useState(getCurrentYearMonth());
   const [residentFilter, setResidentFilter] = useState<'all' | 'lunas' | 'unpaid'>('all');
@@ -257,21 +262,33 @@ export const MonthlyReportView: React.FC<MonthlyReportViewProps> = ({
               </div>
             </div>
 
-            {isAdmin && unpaidResidents.length > 0 && (
-              <button
-                type="button"
-                onClick={() => void handleReminders()}
-                disabled={sendingReminders}
-                className="min-h-[44px] px-4 rounded-xl bg-amber-600 hover:bg-amber-700 disabled:opacity-50 text-white font-semibold text-xs inline-flex items-center gap-2 whitespace-nowrap print:hidden transition-colors cursor-pointer"
-              >
-                <BellRing className="w-4 h-4 shrink-0" />
-                <span>
-                  {sendingReminders
-                    ? 'Mengirim Pengingat...'
-                    : `Kirim Pengingat (${unpaidResidents.length} Warga)`}
-                </span>
-              </button>
-            )}
+            <div className="flex flex-wrap items-center gap-2 print:hidden">
+              {canManageResidents && onOpenResidentRegistry && (
+                <button
+                  type="button"
+                  onClick={onOpenResidentRegistry}
+                  className="min-h-[44px] px-3.5 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 inline-flex items-center gap-1.5 whitespace-nowrap transition-colors cursor-pointer"
+                >
+                  <Database className="w-4 h-4 text-emerald-700 dark:text-emerald-400 shrink-0" />
+                  <span>Database Warga</span>
+                </button>
+              )}
+              {canManageReports && unpaidResidents.length > 0 && (
+                <button
+                  type="button"
+                  onClick={() => void handleReminders()}
+                  disabled={sendingReminders}
+                  className="min-h-[44px] px-4 rounded-xl bg-amber-600 hover:bg-amber-700 disabled:opacity-50 text-white font-semibold text-xs inline-flex items-center gap-2 whitespace-nowrap transition-colors cursor-pointer"
+                >
+                  <BellRing className="w-4 h-4 shrink-0" />
+                  <span>
+                    {sendingReminders
+                      ? 'Mengirim Pengingat...'
+                      : `Kirim Pengingat (${unpaidResidents.length} Warga)`}
+                  </span>
+                </button>
+              )}
+            </div>
           </div>
 
           <div className="px-6 py-3 border-b border-slate-100 dark:border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-3 print:hidden">

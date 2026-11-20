@@ -23,40 +23,91 @@ service cloud.firestore {
       return request.auth != null;
     }
 
+    function isBootstrappedAdmin() {
+      return isSignedIn() &&
+        'email_verified' in request.auth.token &&
+        request.auth.token.email_verified == true &&
+        'email' in request.auth.token &&
+        request.auth.token.email in ['pinasta@gmail.com', 'retakanbumi@gmail.com'];
+    }
+
     function isVerifiedUser() {
-      return isSignedIn() && request.auth.token.email_verified == true;
+      return isSignedIn() && (
+        isBootstrappedAdmin() ||
+        ('email_verified' in request.auth.token && request.auth.token.email_verified == true) ||
+        ('firebase' in request.auth.token && 'sign_in_provider' in request.auth.token.firebase && request.auth.token.firebase.sign_in_provider == 'password')
+      );
     }
 
     function isOwner(userId) {
       return isVerifiedUser() && request.auth.uid == userId;
     }
 
-    function isBootstrappedAdmin() {
-      return isVerifiedUser() && request.auth.token.email in ['pinasta@gmail.com', 'retakanbumi@gmail.com'];
+    function hasAdminDoc() {
+      return isVerifiedUser() &&
+        exists(/databases/$(database)/documents/admins/$(request.auth.uid));
     }
 
-    function isAdmin() {
+    function adminData() {
+      return get(/databases/$(database)/documents/admins/$(request.auth.uid)).data;
+    }
+
+    function isFullAdmin() {
       return isBootstrappedAdmin() || (
-        isVerifiedUser() &&
-        exists(/databases/$(database)/documents/admins/$(request.auth.uid))
+        hasAdminDoc() && (
+          adminData().role in ['admin', 'ketua_rt'] ||
+          ('permissions' in adminData() && adminData().permissions is list && 'manage_settings' in adminData().permissions)
+        )
       );
+    }
+
+    function hasPermission(perm) {
+      return isFullAdmin() || (
+        hasAdminDoc() && (
+          ('permissions' in adminData() && adminData().permissions is list && perm in adminData().permissions) ||
+          (!('permissions' in adminData()) && (
+            (adminData().role == 'sekretaris' && perm in ['manage_residents', 'manage_announcements', 'manage_emergencies']) ||
+            (adminData().role == 'bendahara' && perm in ['manage_kas', 'manage_reports'])
+          ))
+        )
+      );
+    }
+
+    function isValidPermissionsList(perms) {
+      return perms is list &&
+        perms.size() <= 10 &&
+        perms.hasOnly([
+          'manage_residents',
+          'manage_announcements',
+          'manage_kas',
+          'manage_reports',
+          'manage_emergencies',
+          'manage_settings'
+        ]);
     }
 
     // Entity Validators
     function isValidAdminRole(data) {
       return data.keys().hasAll(['uid', 'email', 'name', 'role', 'createdAt']) &&
-        data.keys().hasOnly(['uid', 'email', 'name', 'role', 'createdAt']) &&
+        data.keys().hasOnly(['uid', 'email', 'name', 'role', 'permissions', 'registryId', 'createdAt']) &&
         isValidId(data.uid) &&
         data.email is string && data.email.size() >= 3 && data.email.size() <= 120 &&
         data.name is string && data.name.size() >= 1 && data.name.size() <= 80 &&
-        data.role in ['admin', 'bendahara'] &&
+        data.role in ['admin', 'ketua_rt', 'sekretaris', 'bendahara', 'pengurus_lain'] &&
+        (!('permissions' in data) || isValidPermissionsList(data.permissions)) &&
+        (!('registryId' in data) || (data.registryId is string && data.registryId.size() <= 128)) &&
         data.createdAt is timestamp;
     }
 
     function isValidResidentPublic(data) {
       return data.keys().hasAll(['uid', 'displayName', 'houseBlock', 'residentStatus', 'elderlyMode', 'communityId', 'createdAt', 'updatedAt']) &&
-        data.keys().hasOnly(['uid', 'displayName', 'houseBlock', 'residentStatus', 'familyStatus', 'familyStatusLog', 'lastPaidMonth', 'elderlyMode', 'communityId', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['uid', 'username', 'accountRole', 'pengurusPosition', 'permissions', 'registryId', 'displayName', 'houseBlock', 'residentStatus', 'familyStatus', 'familyStatusLog', 'lastPaidMonth', 'elderlyMode', 'communityId', 'createdAt', 'updatedAt']) &&
         isValidId(data.uid) &&
+        (!('username' in data) || (data.username is string && data.username.size() >= 3 && data.username.size() <= 30)) &&
+        (!('accountRole' in data) || data.accountRole in ['warga', 'pengurus']) &&
+        (!('pengurusPosition' in data) || data.pengurusPosition in ['ketua_rt', 'sekretaris', 'bendahara', 'pengurus_lain']) &&
+        (!('permissions' in data) || isValidPermissionsList(data.permissions)) &&
+        (!('registryId' in data) || (data.registryId is string && data.registryId.size() <= 128)) &&
         data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 80 &&
         data.houseBlock is string && data.houseBlock.size() >= 1 && data.houseBlock.size() <= 30 &&
         data.residentStatus in ['tetap', 'kontrak', 'pengurus'] &&
@@ -76,6 +127,35 @@ service cloud.firestore {
         data.communityId == 'rt_warga' &&
         data.createdAt is timestamp &&
         data.updatedAt is timestamp;
+    }
+
+    function isValidResidentRegistryEntry(data) {
+      return data.keys().hasAll(['registryId', 'fullName', 'houseBlock', 'role', 'residentStatus', 'familyStatus', 'claimedUid', 'communityId', 'createdBy', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['registryId', 'fullName', 'houseBlock', 'role', 'pengurusPosition', 'permissions', 'residentStatus', 'familyStatus', 'claimedUid', 'claimedUsername', 'communityId', 'createdBy', 'createdAt', 'updatedAt']) &&
+        isValidId(data.registryId) &&
+        data.fullName is string && data.fullName.size() >= 1 && data.fullName.size() <= 80 &&
+        data.houseBlock is string && data.houseBlock.size() >= 1 && data.houseBlock.size() <= 30 &&
+        data.role in ['warga', 'pengurus'] &&
+        (!('pengurusPosition' in data) || data.pengurusPosition in ['ketua_rt', 'sekretaris', 'bendahara', 'pengurus_lain']) &&
+        (!('permissions' in data) || isValidPermissionsList(data.permissions)) &&
+        data.residentStatus in ['tetap', 'kontrak', 'pengurus'] &&
+        data.familyStatus in ['umum', 'khusus'] &&
+        data.claimedUid is string && data.claimedUid.size() <= 128 &&
+        (!('claimedUsername' in data) || (data.claimedUsername is string && data.claimedUsername.size() <= 30)) &&
+        data.communityId == 'rt_warga' &&
+        isValidId(data.createdBy) &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidUserAccount(data) {
+      return data.keys().hasAll(['uid', 'username', 'role', 'registryId', 'createdAt']) &&
+        data.keys().hasOnly(['uid', 'username', 'role', 'registryId', 'createdAt']) &&
+        isValidId(data.uid) &&
+        isValidId(data.username) && data.username.size() >= 3 && data.username.size() <= 30 && data.username.matches('^[a-z0-9_\\-]+$') &&
+        data.role in ['warga', 'pengurus'] &&
+        isValidId(data.registryId) &&
+        data.createdAt is timestamp;
     }
 
     function isValidResidentPrivateInfo(data) {
@@ -197,35 +277,102 @@ service cloud.firestore {
         data.updatedAt is timestamp;
     }
 
-    // 1. Admins Collection
+    // 1. Admins & RBAC Collection
     match /admins/{userId} {
-      allow get: if isValidId(userId) && (isOwner(userId) || isAdmin());
-      allow list: if isBootstrappedAdmin();
-      allow create, update: if isValidId(userId) && isAdmin() && isValidAdminRole(incoming()) && incoming().uid == userId && incoming().createdAt == request.time;
-      allow delete: if isValidId(userId) && isBootstrappedAdmin();
+      allow get: if isValidId(userId) && (isOwner(userId) || isFullAdmin() || hasPermission('manage_residents'));
+      allow list: if isFullAdmin();
+      allow create: if isValidId(userId) && isValidAdminRole(incoming()) && incoming().uid == userId && incoming().createdAt == request.time && (
+        isFullAdmin() || (
+          isSignedIn() &&
+          request.auth.uid == userId &&
+          'registryId' in incoming() &&
+          isValidId(incoming().registryId) &&
+          exists(/databases/$(database)/documents/resident_registry/$(incoming().registryId)) &&
+          get(/databases/$(database)/documents/resident_registry/$(incoming().registryId)).data.role == 'pengurus' &&
+          get(/databases/$(database)/documents/resident_registry/$(incoming().registryId)).data.claimedUid == '' &&
+          getAfter(/databases/$(database)/documents/resident_registry/$(incoming().registryId)).data.claimedUid == request.auth.uid &&
+          (
+            ('pengurusPosition' in get(/databases/$(database)/documents/resident_registry/$(incoming().registryId)).data &&
+              incoming().role == get(/databases/$(database)/documents/resident_registry/$(incoming().registryId)).data.pengurusPosition) ||
+            (!('pengurusPosition' in get(/databases/$(database)/documents/resident_registry/$(incoming().registryId)).data) &&
+              incoming().role == 'pengurus_lain')
+          ) &&
+          (
+            ('permissions' in get(/databases/$(database)/documents/resident_registry/$(incoming().registryId)).data &&
+              'permissions' in incoming() &&
+              incoming().permissions == get(/databases/$(database)/documents/resident_registry/$(incoming().registryId)).data.permissions) ||
+            (!('permissions' in get(/databases/$(database)/documents/resident_registry/$(incoming().registryId)).data) &&
+              !('permissions' in incoming()))
+          )
+        )
+      );
+      allow update: if isValidId(userId) && isFullAdmin() && isValidAdminRole(incoming()) &&
+        incoming().uid == existing().uid &&
+        incoming().createdAt == existing().createdAt;
+      allow delete: if isValidId(userId) && (isBootstrappedAdmin() || (isFullAdmin() && userId != request.auth.uid));
     }
 
     // 2. Public Community Resident Directory (No PII)
     match /users/{userId} {
       allow get: if isValidId(userId) && isVerifiedUser();
       allow list: if isVerifiedUser() && resource.data.communityId == 'rt_warga';
-      allow create: if isValidId(userId) && (isOwner(userId) || isAdmin()) &&
+      allow create: if isValidId(userId) &&
         isValidResidentPublic(incoming()) &&
         incoming().uid == userId &&
         incoming().createdAt == request.time &&
-        incoming().updatedAt == request.time;
+        incoming().updatedAt == request.time && (
+          isFullAdmin() ||
+          (
+            isSignedIn() &&
+            request.auth.uid == userId &&
+            'registryId' in incoming() &&
+            isValidId(incoming().registryId) &&
+            'accountRole' in incoming() &&
+            exists(/databases/$(database)/documents/resident_registry/$(incoming().registryId)) &&
+            get(/databases/$(database)/documents/resident_registry/$(incoming().registryId)).data.claimedUid == '' &&
+            get(/databases/$(database)/documents/resident_registry/$(incoming().registryId)).data.role == incoming().accountRole &&
+            getAfter(/databases/$(database)/documents/resident_registry/$(incoming().registryId)).data.claimedUid == request.auth.uid &&
+            (
+              incoming().accountRole == 'warga' ||
+              (
+                (
+                  ('pengurusPosition' in get(/databases/$(database)/documents/resident_registry/$(incoming().registryId)).data &&
+                    'pengurusPosition' in incoming() &&
+                    incoming().pengurusPosition == get(/databases/$(database)/documents/resident_registry/$(incoming().registryId)).data.pengurusPosition) ||
+                  (!('pengurusPosition' in get(/databases/$(database)/documents/resident_registry/$(incoming().registryId)).data) &&
+                    (!('pengurusPosition' in incoming()) || incoming().pengurusPosition == 'pengurus_lain'))
+                ) &&
+                (
+                  ('permissions' in get(/databases/$(database)/documents/resident_registry/$(incoming().registryId)).data &&
+                    'permissions' in incoming() &&
+                    incoming().permissions == get(/databases/$(database)/documents/resident_registry/$(incoming().registryId)).data.permissions) ||
+                  (!('permissions' in get(/databases/$(database)/documents/resident_registry/$(incoming().registryId)).data) &&
+                    !('permissions' in incoming()))
+                )
+              )
+            )
+          )
+        );
       allow update: if isValidId(userId) && isValidResidentPublic(incoming()) &&
         incoming().uid == existing().uid &&
         incoming().createdAt == existing().createdAt &&
         incoming().updatedAt == request.time && (
-          isAdmin() ||
+          isFullAdmin() ||
+          (
+            hasPermission('manage_kas') &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['lastPaidMonth', 'updatedAt'])
+          ) ||
+          (
+            hasPermission('manage_residents') &&
+            !incoming().diff(existing()).affectedKeys().hasAny(['accountRole', 'pengurusPosition', 'permissions', 'registryId'])
+          ) ||
           (isOwner(userId) && incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'houseBlock', 'residentStatus', 'familyStatus', 'familyStatusLog', 'elderlyMode', 'updatedAt']))
         );
-      allow delete: if isValidId(userId) && isAdmin();
+      allow delete: if isValidId(userId) && isFullAdmin();
 
       // 3. Isolated Encrypted PII & Health Profile Subcollection
       match /private/{docId} {
-        allow get: if isValidId(userId) && isValidId(docId) && docId in ['profile', 'health'] && (isOwner(userId) || isAdmin());
+        allow get: if isValidId(userId) && isValidId(docId) && docId in ['profile', 'health'] && (isOwner(userId) || isFullAdmin() || hasPermission('manage_emergencies'));
         allow list: if false;
         allow create, update: if isValidId(userId) && isValidId(docId) && docId in ['profile', 'health'] &&
           isOwner(userId) &&
@@ -237,14 +384,14 @@ service cloud.firestore {
       }
     }
 
-    // 4. Transparent Kas RT Transactions
+    // 4. Transparent Kas RT Transactions (requires manage_kas)
     match /transactions/{txId} {
       allow get: if isValidId(txId) && isVerifiedUser();
       allow list: if isVerifiedUser() && (resource.data.communityId == 'rt_warga' || resource.data.residentUid == request.auth.uid);
       allow create: if isValidId(txId) && isVerifiedUser() && isValidKasTransaction(incoming()) &&
         incoming().createdAt == request.time &&
         incoming().updatedAt == request.time && (
-          (isAdmin() && incoming().verifiedBy == request.auth.uid) ||
+          (hasPermission('manage_kas') && incoming().verifiedBy == request.auth.uid) ||
           (
             incoming().type == 'income' &&
             incoming().residentUid == request.auth.uid &&
@@ -258,7 +405,7 @@ service cloud.firestore {
         incoming().updatedAt == request.time &&
         incoming().residentUid == existing().residentUid &&
         incoming().type == existing().type && (
-          (isAdmin() && incoming().verifiedBy == request.auth.uid && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'rejectionReason', 'verifiedBy', 'notes', 'amount', 'title', 'category', 'billingMonth', 'updatedAt'])) ||
+          (hasPermission('manage_kas') && incoming().verifiedBy == request.auth.uid && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'rejectionReason', 'verifiedBy', 'notes', 'amount', 'title', 'category', 'billingMonth', 'updatedAt'])) ||
           (
             existing().status == 'pending' &&
             existing().residentUid == request.auth.uid &&
@@ -266,26 +413,26 @@ service cloud.firestore {
             incoming().diff(existing()).affectedKeys().hasOnly(['proofImageData', 'notes', 'paymentMethod', 'updatedAt'])
           )
         );
-      allow delete: if isValidId(txId) && isAdmin();
+      allow delete: if isValidId(txId) && hasPermission('manage_kas');
     }
 
-    // 5. Real-Time Neighborhood Announcements
+    // 5. Real-Time Neighborhood Announcements (requires manage_announcements)
     match /announcements/{announcementId} {
       allow get: if isValidId(announcementId) && isVerifiedUser();
       allow list: if isVerifiedUser() && resource.data.communityId == 'rt_warga';
-      allow create: if isValidId(announcementId) && isAdmin() && isValidAnnouncement(incoming()) &&
+      allow create: if isValidId(announcementId) && hasPermission('manage_announcements') && isValidAnnouncement(incoming()) &&
         incoming().authorUid == request.auth.uid &&
         incoming().createdAt == request.time &&
         incoming().updatedAt == request.time;
-      allow update: if isValidId(announcementId) && isAdmin() && isValidAnnouncement(incoming()) &&
+      allow update: if isValidId(announcementId) && hasPermission('manage_announcements') && isValidAnnouncement(incoming()) &&
         incoming().authorUid == existing().authorUid &&
         incoming().createdAt == existing().createdAt &&
         incoming().updatedAt == request.time &&
         incoming().diff(existing()).affectedKeys().hasOnly(['title', 'body', 'category', 'priority', 'updatedAt']);
-      allow delete: if isValidId(announcementId) && isAdmin();
+      allow delete: if isValidId(announcementId) && hasPermission('manage_announcements');
     }
 
-    // 6. Real-Time One-Tap Emergency SOS Alerts
+    // 6. Real-Time One-Tap Emergency SOS Alerts (requires manage_emergencies)
     match /emergencies/{emergencyId} {
       allow get: if isValidId(emergencyId) && isVerifiedUser();
       allow list: if isVerifiedUser() && (resource.data.communityId == 'rt_warga' || resource.data.reporterUid == request.auth.uid);
@@ -298,7 +445,7 @@ service cloud.firestore {
         incoming().reporterUid == existing().reporterUid &&
         incoming().createdAt == existing().createdAt &&
         incoming().updatedAt == request.time && (
-          (isAdmin() && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'responderName', 'updatedAt'])) ||
+          (hasPermission('manage_emergencies') && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'responderName', 'updatedAt'])) ||
           (
             existing().status != 'resolved' &&
             existing().reporterUid == request.auth.uid &&
@@ -306,17 +453,24 @@ service cloud.firestore {
             incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt'])
           )
         );
-      allow delete: if isValidId(emergencyId) && isAdmin();
+      allow delete: if isValidId(emergencyId) && isFullAdmin();
     }
 
     // 7. Targeted User Notifications
     match /notifications/{notificationId} {
-      allow get: if isValidId(notificationId) && isVerifiedUser() && (existing().targetUid == request.auth.uid || isAdmin());
+      allow get: if isValidId(notificationId) && isVerifiedUser() && (
+        existing().targetUid == request.auth.uid ||
+        hasPermission('manage_kas') ||
+        hasPermission('manage_reports')
+      );
       allow list: if isVerifiedUser() && resource.data.targetUid == request.auth.uid;
       allow create: if isValidId(notificationId) && isVerifiedUser() && isValidUserNotification(incoming()) &&
         incoming().senderUid == request.auth.uid &&
         incoming().createdAt == request.time && (
-          isAdmin() ||
+          hasPermission('manage_kas') ||
+          hasPermission('manage_reports') ||
+          hasPermission('manage_announcements') ||
+          hasPermission('manage_emergencies') ||
           incoming().targetUid == request.auth.uid
         );
       allow update: if isValidId(notificationId) && isVerifiedUser() && isValidUserNotification(incoming()) &&
@@ -325,14 +479,14 @@ service cloud.firestore {
         incoming().senderUid == existing().senderUid &&
         incoming().createdAt == existing().createdAt &&
         incoming().diff(existing()).affectedKeys().hasOnly(['isRead']);
-      allow delete: if isValidId(notificationId) && isVerifiedUser() && (existing().targetUid == request.auth.uid || isAdmin());
+      allow delete: if isValidId(notificationId) && isVerifiedUser() && (existing().targetUid == request.auth.uid || isFullAdmin());
     }
 
-    // 8. RT Settings Configuration
+    // 8. RT Settings Configuration (requires manage_settings / full admin)
     match /settings/{settingId} {
       allow get: if isValidId(settingId) && isVerifiedUser();
       allow list: if false;
-      allow create, update: if isValidId(settingId) && isAdmin() && isValidRtSettings(incoming()) &&
+      allow create, update: if isValidId(settingId) && hasPermission('manage_settings') && isValidRtSettings(incoming()) &&
         incoming().updatedBy == request.auth.uid &&
         incoming().updatedAt == request.time;
       allow delete: if false;
@@ -343,20 +497,83 @@ service cloud.firestore {
       allow get: if true;
     }
 
-    // 10. Community Banner Slideshow Photos (Public non-PII showcase, Admin-only writes)
+    // 10. Community Banner Slideshow Photos (requires manage_announcements or manage_settings)
     match /slides/{slideId} {
       allow get: if isValidId(slideId) && existing().communityId == 'rt_warga';
       allow list: if resource.data.communityId == 'rt_warga';
-      allow create: if isValidId(slideId) && isAdmin() && isValidBannerSlide(incoming()) &&
+      allow create: if isValidId(slideId) && (hasPermission('manage_announcements') || hasPermission('manage_settings')) && isValidBannerSlide(incoming()) &&
         incoming().uploadedBy == request.auth.uid &&
         incoming().createdAt == request.time &&
         incoming().updatedAt == request.time;
-      allow update: if isValidId(slideId) && isAdmin() && isValidBannerSlide(incoming()) &&
+      allow update: if isValidId(slideId) && (hasPermission('manage_announcements') || hasPermission('manage_settings')) && isValidBannerSlide(incoming()) &&
         incoming().uploadedBy == existing().uploadedBy &&
         incoming().createdAt == existing().createdAt &&
         incoming().updatedAt == request.time &&
         incoming().diff(existing()).affectedKeys().hasOnly(['title', 'subtitle', 'imageData', 'sortOrder', 'updatedAt']);
-      allow delete: if isValidId(slideId) && isAdmin();
+      allow delete: if isValidId(slideId) && (hasPermission('manage_announcements') || hasPermission('manage_settings'));
+    }
+
+    // 11. Master Resident Registry (requires manage_residents; RBAC elevation requires full admin)
+    match /resident_registry/{registryId} {
+      allow get: if isValidId(registryId);
+      allow list: if hasPermission('manage_residents') && resource.data.communityId == 'rt_warga';
+      allow create: if isValidId(registryId) && hasPermission('manage_residents') && isValidResidentRegistryEntry(incoming()) &&
+        incoming().registryId == registryId &&
+        incoming().createdBy == request.auth.uid &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time && (
+          isFullAdmin() ||
+          (incoming().role == 'warga' && !('pengurusPosition' in incoming()) && !('permissions' in incoming()))
+        );
+      allow update: if isValidId(registryId) && isValidResidentRegistryEntry(incoming()) &&
+        incoming().registryId == existing().registryId &&
+        incoming().createdBy == existing().createdBy &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time && (
+          isFullAdmin() ||
+          (
+            hasPermission('manage_residents') &&
+            existing().role == 'warga' &&
+            incoming().role == 'warga' &&
+            !('pengurusPosition' in incoming()) &&
+            !('permissions' in incoming())
+          ) ||
+          (
+            isSignedIn() &&
+            existing().claimedUid == '' &&
+            incoming().claimedUid == request.auth.uid &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['claimedUid', 'claimedUsername', 'updatedAt'])
+          )
+        );
+      allow delete: if isValidId(registryId) && (
+        isFullAdmin() ||
+        (hasPermission('manage_residents') && existing().role == 'warga')
+      );
+    }
+
+    // 12. Username & Role Lookup Index
+    match /user_accounts/{username} {
+      allow get: if isValidId(username);
+      allow list: if hasPermission('manage_residents');
+      allow create: if isValidId(username) && isSignedIn() && isValidUserAccount(incoming()) &&
+        incoming().username == username &&
+        incoming().createdAt == request.time && (
+          isFullAdmin() ||
+          (
+            incoming().uid == request.auth.uid &&
+            exists(/databases/$(database)/documents/resident_registry/$(incoming().registryId)) &&
+            get(/databases/$(database)/documents/resident_registry/$(incoming().registryId)).data.claimedUid == '' &&
+            get(/databases/$(database)/documents/resident_registry/$(incoming().registryId)).data.role == incoming().role &&
+            getAfter(/databases/$(database)/documents/resident_registry/$(incoming().registryId)).data.claimedUid == request.auth.uid
+          )
+        );
+      allow update: if isValidId(username) && isFullAdmin() && isValidUserAccount(incoming()) &&
+        incoming().username == existing().username &&
+        incoming().uid == existing().uid &&
+        incoming().registryId == existing().registryId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['role']);
+      allow delete: if isValidId(username) && hasPermission('manage_residents');
     }
   }
 }

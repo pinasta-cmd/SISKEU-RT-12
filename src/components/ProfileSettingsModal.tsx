@@ -6,6 +6,7 @@ import {
   Bell,
   BookOpen,
   Check,
+  Database,
   ImagePlus,
   Images,
   LogOut,
@@ -22,6 +23,7 @@ import type {
   BannerSlide,
   FamilyStatus,
   KasTransaction,
+  RbacContext,
   ResidentPublic,
   ResidentStatus,
   RtSettings,
@@ -36,6 +38,7 @@ import {
   parseFamilyStatusLog,
   requestBrowserPushPermission,
 } from '../utils/format';
+import { PENGURUS_POSITION_DESCRIPTIONS, RBAC_PERMISSION_META } from '../utils/rbac';
 import { PWAInstallButton } from './PWAInstallButton';
 
 interface ProfileSettingsModalProps {
@@ -43,7 +46,7 @@ interface ProfileSettingsModalProps {
   onClose: () => void;
   profile: ResidentPublic;
   userEmail: string;
-  isAdmin: boolean;
+  rbac: RbacContext;
   darkMode: boolean;
   onToggleDarkMode: () => void;
   elderlyMode: boolean;
@@ -51,6 +54,8 @@ interface ProfileSettingsModalProps {
   rtSettings: RtSettings;
   transactions?: KasTransaction[];
   bannerSlides?: BannerSlide[];
+  registryCount?: number;
+  onOpenResidentRegistry?: () => void;
   onSaveProfile: (data: {
     displayName: string;
     houseBlock: string;
@@ -83,7 +88,7 @@ export const ProfileSettingsModal: React.FC<ProfileSettingsModalProps> = ({
   onClose,
   profile,
   userEmail,
-  isAdmin,
+  rbac,
   darkMode,
   onToggleDarkMode,
   elderlyMode,
@@ -91,6 +96,8 @@ export const ProfileSettingsModal: React.FC<ProfileSettingsModalProps> = ({
   rtSettings,
   transactions = [],
   bannerSlides = [],
+  registryCount = 0,
+  onOpenResidentRegistry,
   onSaveProfile,
   onSaveRtSettings,
   onAddBannerSlide,
@@ -366,7 +373,10 @@ export const ProfileSettingsModal: React.FC<ProfileSettingsModalProps> = ({
               Pengaturan Akun & Aksesibilitas
             </h2>
             <p className="text-xs text-slate-500 dark:text-slate-400">
-              {userEmail} · {isAdmin ? 'Admin / Bendahara RT' : 'Warga RT'}
+              {profile.username ? `@${profile.username}` : userEmail} ·{' '}
+              <span className="font-semibold text-emerald-700 dark:text-emerald-400">
+                {rbac.positionLabel}
+              </span>
             </p>
           </div>
           <button
@@ -383,6 +393,42 @@ export const ProfileSettingsModal: React.FC<ProfileSettingsModalProps> = ({
           {feedback && (
             <div className="rounded-2xl bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 p-3.5 text-xs font-semibold text-emerald-800 dark:text-emerald-200">
               {feedback}
+            </div>
+          )}
+
+          {rbac.isPengurus && rbac.position !== 'warga' && (
+            <div className="rounded-2xl bg-emerald-50/70 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-900 p-4 space-y-2.5">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2 text-emerald-800 dark:text-emerald-300">
+                  <ShieldCheck className="w-4 h-4 shrink-0" />
+                  <span className="text-xs font-extrabold uppercase tracking-wider">
+                    Jabatan: {rbac.positionLabel}
+                  </span>
+                </div>
+                <span className="text-[11px] font-semibold text-emerald-700 dark:text-emerald-400">
+                  {rbac.isFullAdmin ? 'Admin Penuh' : `${rbac.permissions.length} Kewenangan`}
+                </span>
+              </div>
+              <p className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed">
+                {PENGURUS_POSITION_DESCRIPTIONS[rbac.position]}
+              </p>
+              <div className="flex flex-wrap gap-1.5 pt-0.5">
+                {RBAC_PERMISSION_META.map((perm) => {
+                  const granted = rbac.isFullAdmin || rbac.permissions.includes(perm.id);
+                  return (
+                    <span
+                      key={perm.id}
+                      className={`px-2 py-0.5 rounded-md text-[11px] font-semibold border ${
+                        granted
+                          ? 'bg-white dark:bg-slate-900 border-emerald-300 dark:border-emerald-700 text-emerald-800 dark:text-emerald-300'
+                          : 'bg-slate-100/80 dark:bg-slate-900/50 border-slate-200 dark:border-slate-800 text-slate-400 dark:text-slate-500 line-through'
+                      }`}
+                    >
+                      {perm.shortLabel}
+                    </span>
+                  );
+                })}
+              </div>
             </div>
           )}
 
@@ -476,7 +522,7 @@ export const ProfileSettingsModal: React.FC<ProfileSettingsModalProps> = ({
                   type="text"
                   required
                   maxLength={25}
-                  placeholder="Contoh: Blok B-08"
+                  placeholder="Contoh: FF3/5"
                   value={houseBlock}
                   onChange={(e) => setHouseBlock(e.target.value)}
                   className="w-full min-h-[44px] px-3.5 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-sm"
@@ -494,7 +540,9 @@ export const ProfileSettingsModal: React.FC<ProfileSettingsModalProps> = ({
                 >
                   <option value="tetap">Warga Tetap</option>
                   <option value="kontrak">Warga Kontrak/Sewa</option>
-                  <option value="pengurus">Pengurus RT</option>
+                  {(rbac.isPengurus || residentStatus === 'pengurus') && (
+                    <option value="pengurus">Pengurus RT</option>
+                  )}
                 </select>
               </div>
               <div>
@@ -548,8 +596,41 @@ export const ProfileSettingsModal: React.FC<ProfileSettingsModalProps> = ({
             </button>
           </form>
 
-          {/* Admin RT Settings */}
-          {isAdmin && (
+          {/* Database Warga Shortcut (Ketua RT & Sekretaris) */}
+          {rbac.canManageResidents && onOpenResidentRegistry && (
+            <div className="pt-5 border-t border-slate-100 dark:border-slate-800">
+              <div className="rounded-2xl bg-emerald-50/70 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-900 p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div className="flex items-start gap-3">
+                  <div className="w-9 h-9 rounded-xl bg-emerald-700 text-white flex items-center justify-center shrink-0">
+                    <Database className="w-4 h-4" />
+                  </div>
+                  <div>
+                    <p className="text-sm font-bold text-slate-900 dark:text-slate-100">
+                      Database Warga &amp; Pengurus ({registryCount} data)
+                    </p>
+                    <p className="text-xs text-slate-600 dark:text-slate-400 mt-0.5">
+                      {rbac.isFullAdmin
+                        ? 'Kelola data warga, jabatan pengurus (Ketua RT, Sekretaris, Bendahara, Pengurus Lain) & kewenangan RBAC.'
+                        : 'Kelola daftar Nama Lengkap & Blok Rumah warga yang diizinkan mendaftar akun.'}
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    onClose();
+                    onOpenResidentRegistry();
+                  }}
+                  className="min-h-[42px] px-4 rounded-xl bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-semibold whitespace-nowrap shrink-0 cursor-pointer"
+                >
+                  Kelola Database Warga
+                </button>
+              </div>
+            </div>
+          )}
+
+          {/* Full Admin RT Settings (Ketua RT / manage_settings) */}
+          {rbac.canManageSettings && (
             <form
               onSubmit={(e) => void handleSaveAdminConfig(e)}
               className="pt-5 border-t border-slate-100 dark:border-slate-800 space-y-4"
@@ -675,8 +756,8 @@ export const ProfileSettingsModal: React.FC<ProfileSettingsModalProps> = ({
             </form>
           )}
 
-          {/* Admin Slideshow Manager (Local Storage Photo Upload) */}
-          {isAdmin && onAddBannerSlide && (
+          {/* Admin Slideshow Manager (manage_announcements or manage_settings) */}
+          {(rbac.canManageAnnouncements || rbac.canManageSettings) && onAddBannerSlide && (
             <div className="pt-5 border-t border-slate-100 dark:border-slate-800 space-y-4">
               <div className="flex items-start justify-between gap-3">
                 <div className="flex items-center gap-2 text-emerald-700 dark:text-emerald-400">

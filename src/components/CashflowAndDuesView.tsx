@@ -36,7 +36,7 @@ import {
 interface CashflowAndDuesViewProps {
   profile: ResidentPublic;
   residents: ResidentPublic[];
-  isAdmin: boolean;
+  canManageKas: boolean;
   isOnline: boolean;
   rtSettings: RtSettings;
   transactions: KasTransaction[];
@@ -69,7 +69,7 @@ interface CashflowAndDuesViewProps {
 export const CashflowAndDuesView: React.FC<CashflowAndDuesViewProps> = ({
   profile,
   residents,
-  isAdmin,
+  canManageKas,
   isOnline,
   rtSettings,
   transactions,
@@ -280,7 +280,7 @@ export const CashflowAndDuesView: React.FC<CashflowAndDuesViewProps> = ({
             <span>Bayar Iuran</span>
           </button>
 
-          {isAdmin && (
+          {canManageKas && (
             <button
               type="button"
               onClick={() => {
@@ -337,7 +337,7 @@ export const CashflowAndDuesView: React.FC<CashflowAndDuesViewProps> = ({
           )}
           {rtSettings.bankAccountNumber && (
             <p className="text-xs text-slate-500 dark:text-slate-400">
-              Rekening RT: {rtSettings.bankName || 'Bank'} <span className="font-mono-num font-semibold text-slate-700 dark:text-slate-200">{rtSettings.bankAccountNumber}</span> a.n. {rtSettings.bankAccountHolder || 'Kas RT'}
+              Rekening RT: {rtSettings.bankName || 'Bank'} <span className="font-mono-num font-semibold text-slate-700 dark:text-slate-200">{rtSettings.bankAccountNumber}</span> an. {rtSettings.bankAccountHolder || 'Kas RT'}
             </p>
           )}
         </div>
@@ -551,7 +551,7 @@ export const CashflowAndDuesView: React.FC<CashflowAndDuesViewProps> = ({
       )}
 
       {/* Admin Create Income/Expense Form */}
-      {isAdmin && showAdminEntryForm && (
+      {canManageKas && showAdminEntryForm && (
         <form
           onSubmit={(e) => void handleAdminEntrySubmit(e)}
           className="rounded-3xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 p-6 space-y-4"
@@ -676,7 +676,7 @@ export const CashflowAndDuesView: React.FC<CashflowAndDuesViewProps> = ({
       )}
 
       {/* Admin Real-Time Verification Queue */}
-      {isAdmin && pendingList.length > 0 && (
+      {canManageKas && pendingList.length > 0 && (
         <section className="rounded-3xl bg-amber-50/70 dark:bg-amber-950/20 border border-amber-200 dark:border-amber-900 p-5 sm:p-6 space-y-4">
           <div className="flex items-center justify-between gap-3">
             <div className="flex items-center gap-2.5">
