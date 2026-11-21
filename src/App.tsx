@@ -1,32 +1,18 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  createUserWithEmailAndPassword,
-  onAuthStateChanged,
-  signInWithEmailAndPassword,
-  signInWithPopup,
-  signOut,
-  updateProfile,
-  type User,
-} from 'firebase/auth';
-import {
-  addDoc,
-  collection,
-  deleteDoc,
-  deleteField,
-  doc,
-  getDoc,
-  onSnapshot,
-  query,
-  serverTimestamp,
-  setDoc,
-  updateDoc,
-  where,
-  writeBatch,
-} from 'firebase/firestore';
-import { BellRing, BookOpen, RefreshCw, WifiOff, X } from 'lucide-react';
+  BellRing,
+  BookOpen,
+  FileSpreadsheet,
+  FolderPlus,
+  Link2,
+  RefreshCw,
+  WifiOff,
+  X,
+} from 'lucide-react';
 import { motion } from 'motion/react';
 import { AnnouncementsView } from './components/AnnouncementsView';
 import { CashflowAndDuesView } from './components/CashflowAndDuesView';
+import { ConfirmActionModal } from './components/ConfirmActionModal';
 import { DashboardView } from './components/DashboardView';
 import { EmergencyAndHealthView } from './components/EmergencyAndHealthView';
 import { HeaderNav } from './components/HeaderNav';
@@ -37,8 +23,19 @@ import { OnboardingTutorial } from './components/OnboardingTutorial';
 import { ProfileSettingsModal } from './components/ProfileSettingsModal';
 import { ResidentRegistryModal } from './components/ResidentRegistryModal';
 import { useOnlineStatus } from './hooks/useOnlineStatus';
-import { decryptSensitiveJson, encryptSensitiveJson } from './lib/crypto';
-import { auth, db, googleProvider, handleFirestoreError, OperationType } from './lib/firebase';
+import {
+  decryptSensitiveJson,
+  encryptSensitiveJson,
+  hashPassword,
+  verifyPassword,
+} from './lib/crypto';
+import {
+  clearGoogleAccessToken,
+  getGoogleAccessToken,
+  googleWorkspaceSignIn,
+  googleWorkspaceSignOut,
+  initGoogleAuth,
+} from './lib/googleAuth';
 import {
   enqueueOfflineAction,
   getCachedBannerSlides,
@@ -47,11 +44,38 @@ import {
   saveCachedBannerSlides,
   saveOfflineSnapshot,
 } from './lib/offlineSync';
+import {
+  adminRecordToRow,
+  announcementToRow,
+  appendSheetRows,
+  clearSavedSpreadsheetId,
+  connectAndEnsureSchema,
+  createAppDatabaseSpreadsheet,
+  deleteSheetRowsByKey,
+  emergencyToRow,
+  extractSpreadsheetId,
+  fetchAllSheetTables,
+  findAppDatabaseSpreadsheet,
+  generateRecordId,
+  getSavedSpreadsheetId,
+  notificationToRow,
+  privateDataToRow,
+  registryEntryToRow,
+  settingsToRow,
+  SheetsAuthExpiredError,
+  SHEET_TABS,
+  slideToRow,
+  transactionToRow,
+  upsertSheetRowsByKey,
+  userAccountToRow,
+  userProfileToRow,
+} from './lib/sheetsDb';
 import type {
   AdminRoleRecord,
   Announcement,
   AnnouncementCategory,
   AppTab,
+  AppUserSession,
   BannerSlide,
   EmergencyAlert,
   EmergencyType,
@@ -60,6 +84,7 @@ import type {
   LoginRole,
   PaymentMethod,
   PengurusPosition,
+  PrivateDataRecord,
   PrivateHealthData,
   PrivateProfileData,
   RbacPermission,
@@ -67,6 +92,7 @@ import type {
   ResidentRegistryEntry,
   ResidentStatus,
   RtSettings,
+  SheetDbInfo,
   TransactionCategory,
   UserAccountLookup,
   UserNotification,
@@ -78,11 +104,6 @@ import {
   usernameToAuthEmail,
 } from './utils/authRegistry';
 import {
-  ALL_RBAC_PERMISSIONS,
-  normalizePengurusPermissions,
-  resolveUserRbac,
-} from './utils/rbac';
-import {
   buildUpdatedFamilyStatusLog,
   calculateResidentLedger,
   formatMonthLabel,
@@ -93,6 +114,11 @@ import {
   getResidentFamilyStatusForMonth,
   sendBrowserPush,
 } from './utils/format';
+import {
+  ALL_RBAC_PERMISSIONS,
+  normalizePengurusPermissions,
+  resolveUserRbac,
+} from './utils/rbac';
 
 const DEFAULT_RT_SETTINGS: RtSettings = {
   rtName: 'RT 12',
@@ -124,14 +150,33 @@ const DEFAULT_HEALTH_PROFILE: PrivateHealthData = {
   shareInEmergency: true,
 };
 
+const BOOTSTRAPPED_ADMIN_EMAILS = ['pinasta@gmail.com', 'retakanbumi@gmail.com'];
+
+interface ConfirmPromptState {
+  title: string;
+  description: string;
+  details?: string[];
+  confirmLabel?: string;
+  destructive?: boolean;
+  resolve: (confirmed: boolean) => void;
+}
+
 function sortByCreatedAtDesc<T extends { createdAt?: unknown }>(items: T[]): T[] {
   return [...items].sort((a, b) => {
     const getMs = (val: unknown): number => {
-      if (!val) return Date.now();
-      if (typeof val === 'object' && val !== null && 'toMillis' in val && typeof (val as { toMillis: () => number }).toMillis === 'function') {
+      if (!val) return 0;
+      if (
+        typeof val === 'object' &&
+        val !== null &&
+        'toMillis' in val &&
+        typeof (val as { toMillis: () => number }).toMillis === 'function'
+      ) {
         return (val as { toMillis: () => number }).toMillis();
       }
-      if (typeof val === 'string' || typeof val === 'number') return new Date(val).getTime();
+      if (typeof val === 'string' || typeof val === 'number') {
+        const t = new Date(val).getTime();
+        return Number.isNaN(t) ? 0 : t;
+      }
       return 0;
     };
     return getMs(b.createdAt) - getMs(a.createdAt);
@@ -148,8 +193,18 @@ export default function App() {
     return localStorage.getItem('kaswarga_elderly_mode') === 'true';
   });
 
+  // Google Workspace OAuth & Spreadsheet connection state
   const [authReady, setAuthReady] = useState(false);
-  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [googleConnected, setGoogleConnected] = useState(false);
+  const [googleUserEmail, setGoogleUserEmail] = useState<string | null>(null);
+  const [googleDisplayName, setGoogleDisplayName] = useState<string | null>(null);
+  const [googleUid, setGoogleUid] = useState<string | null>(null);
+  const [sheetInfo, setSheetInfo] = useState<SheetDbInfo | null>(null);
+  const [isConnectingSheet, setIsConnectingSheet] = useState(false);
+  const [isSyncing, setIsSyncing] = useState(false);
+
+  // Active SISKEU RT user session (Warga / Pengurus)
+  const [currentUser, setCurrentUser] = useState<AppUserSession | null>(null);
   const [isLoggingIn, setIsLoggingIn] = useState(false);
   const [loginError, setLoginError] = useState<string | null>(null);
 
@@ -158,6 +213,48 @@ export default function App() {
   const [profile, setProfile] = useState<ResidentPublic | null>(null);
   const [privateProfile, setPrivateProfile] = useState<PrivateProfileData>(DEFAULT_PRIVATE_PROFILE);
   const [healthProfile, setHealthProfile] = useState<PrivateHealthData>(DEFAULT_HEALTH_PROFILE);
+
+  // Spreadsheet database tables cached in state
+  const [rtSettings, setRtSettings] = useState<RtSettings>(DEFAULT_RT_SETTINGS);
+  const [residents, setResidents] = useState<ResidentPublic[]>([]);
+  const [registryEntries, setRegistryEntries] = useState<ResidentRegistryEntry[]>([]);
+  const [userAccounts, setUserAccounts] = useState<UserAccountLookup[]>([]);
+  const [adminRecords, setAdminRecords] = useState<AdminRoleRecord[]>([]);
+  const [privateDataRecords, setPrivateDataRecords] = useState<PrivateDataRecord[]>([]);
+  const [transactions, setTransactions] = useState<KasTransaction[]>([]);
+  const [announcements, setAnnouncements] = useState<Announcement[]>([]);
+  const [emergencies, setEmergencies] = useState<EmergencyAlert[]>([]);
+  const [allNotifications, setAllNotifications] = useState<UserNotification[]>([]);
+  const [bannerSlides, setBannerSlides] = useState<BannerSlide[]>(() => getCachedBannerSlides());
+
+  const [activeTab, setActiveTab] = useState<AppTab>('beranda');
+  const [openPaymentModalOnKas, setOpenPaymentModalOnKas] = useState(false);
+  const [tutorialOpen, setTutorialOpen] = useState(false);
+  const [showNewUserBanner, setShowNewUserBanner] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [registryOpen, setRegistryOpen] = useState(false);
+  const [liveToast, setLiveToast] = useState<{
+    title: string;
+    body: string;
+    urgent?: boolean;
+  } | null>(null);
+  const [offlineQueueCount, setOfflineQueueCount] = useState<number>(
+    () => getOfflineQueue().length
+  );
+  const [confirmPrompt, setConfirmPrompt] = useState<ConfirmPromptState | null>(null);
+  const [adminSheetInput, setAdminSheetInput] = useState('');
+
+  const initialAnnouncementIdsRef = useRef<Set<string> | null>(null);
+  const initialNotificationIdsRef = useRef<Set<string> | null>(null);
+  const initialEmergencyIdsRef = useRef<Set<string> | null>(null);
+  const isMutatingRef = useRef(false);
+
+  const notifications = useMemo(() => {
+    if (!currentUser) return [];
+    return sortByCreatedAtDesc(
+      allNotifications.filter((n) => n.targetUid === currentUser.uid)
+    );
+  }, [allNotifications, currentUser]);
 
   const rbac = useMemo(
     () =>
@@ -168,30 +265,6 @@ export default function App() {
       }),
     [isBootstrappedAdminUser, adminRecord, profile]
   );
-
-  const [rtSettings, setRtSettings] = useState<RtSettings>(DEFAULT_RT_SETTINGS);
-  const [transactions, setTransactions] = useState<KasTransaction[]>([]);
-  const [residents, setResidents] = useState<ResidentPublic[]>([]);
-  const [registryEntries, setRegistryEntries] = useState<ResidentRegistryEntry[]>([]);
-  const [announcements, setAnnouncements] = useState<Announcement[]>([]);
-  const [emergencies, setEmergencies] = useState<EmergencyAlert[]>([]);
-  const [notifications, setNotifications] = useState<UserNotification[]>([]);
-  const [bannerSlides, setBannerSlides] = useState<BannerSlide[]>(() => getCachedBannerSlides());
-
-  const [activeTab, setActiveTab] = useState<AppTab>('beranda');
-  const [openPaymentModalOnKas, setOpenPaymentModalOnKas] = useState(false);
-  const [tutorialOpen, setTutorialOpen] = useState(false);
-  const [showNewUserBanner, setShowNewUserBanner] = useState(false);
-  const [settingsOpen, setSettingsOpen] = useState(false);
-  const [registryOpen, setRegistryOpen] = useState(false);
-  const [liveToast, setLiveToast] = useState<{ title: string; body: string; urgent?: boolean } | null>(null);
-  const [offlineQueueCount, setOfflineQueueCount] = useState<number>(() => getOfflineQueue().length);
-
-  const isRegisteringRef = useRef(false);
-  const expectedLoginRoleRef = useRef<LoginRole | null>(null);
-  const initialAnnouncementIdsRef = useRef<Set<string> | null>(null);
-  const initialNotificationIdsRef = useRef<Set<string> | null>(null);
-  const initialEmergencyIdsRef = useRef<Set<string> | null>(null);
 
   useEffect(() => {
     document.documentElement.classList.toggle('dark', darkMode);
@@ -211,239 +284,103 @@ export default function App() {
     }, 6500);
   }, []);
 
-  // Auth & Profile Bootstrap
-  useEffect(() => {
-    const unsubscribe = onAuthStateChanged(auth, async (user) => {
-      if (isRegisteringRef.current) return;
-      setCurrentUser(user);
-      if (!user) {
-        setProfile(null);
-        setAdminRecord(null);
-        setIsBootstrappedAdminUser(false);
-        setAuthReady(true);
-        return;
-      }
+  const requestSheetConfirmation = useCallback(
+    (opts: {
+      title: string;
+      description: string;
+      details?: string[];
+      confirmLabel?: string;
+      destructive?: boolean;
+    }): Promise<boolean> => {
+      return new Promise((resolve) => {
+        setConfirmPrompt({
+          ...opts,
+          resolve: (confirmed) => {
+            setConfirmPrompt(null);
+            resolve(confirmed);
+          },
+        });
+      });
+    },
+    []
+  );
 
+  const handleExpiredToken = useCallback(() => {
+    clearGoogleAccessToken();
+    setGoogleConnected(false);
+    setCurrentUser(null);
+    setProfile(null);
+    setAdminRecord(null);
+    setIsBootstrappedAdminUser(false);
+    setLoginError(
+      'Sesi akses Google Spreadsheet telah berakhir. Silakan klik "Sign in with Google" untuk menghubungkan ulang.'
+    );
+  }, []);
+
+  const requireActiveSheet = useCallback((): {
+    token: string;
+    spreadsheetId: string;
+    spreadsheetTitle: string;
+  } | null => {
+    const token = getGoogleAccessToken();
+    if (!token) {
+      handleExpiredToken();
+      return null;
+    }
+    if (!sheetInfo?.spreadsheetId) {
+      showToast(
+        'Database Spreadsheet Belum Dibuat',
+        rbac.isFullAdmin
+          ? 'Klik "Buat Database Spreadsheet Baru" pada panel Admin di atas terlebih dahulu.'
+          : 'Database Google Spreadsheet belum dibuat atau dihubungkan oleh Admin RT.',
+        true
+      );
+      return null;
+    }
+    return {
+      token,
+      spreadsheetId: sheetInfo.spreadsheetId,
+      spreadsheetTitle: sheetInfo.spreadsheetTitle,
+    };
+  }, [
+    handleExpiredToken,
+    sheetInfo?.spreadsheetId,
+    sheetInfo?.spreadsheetTitle,
+    showToast,
+    rbac.isFullAdmin,
+  ]);
+
+  const refreshSpreadsheetData = useCallback(
+    async (
+      overrideToken?: string,
+      overrideSpreadsheetId?: string,
+      silent = false
+    ) => {
+      const token = overrideToken || getGoogleAccessToken();
+      const targetId = overrideSpreadsheetId || sheetInfo?.spreadsheetId;
+      if (!token || !targetId) return null;
+
+      if (!silent) setIsSyncing(true);
       try {
-        const isBootstrapped =
-          ['pinasta@gmail.com', 'retakanbumi@gmail.com'].includes(user.email || '') &&
-          user.emailVerified;
-        let loadedAdminRecord: AdminRoleRecord | null = null;
+        const snap = await fetchAllSheetTables(token, targetId);
 
-        try {
-          const adminDoc = await getDoc(doc(db, 'admins', user.uid));
-          if (adminDoc.exists()) {
-            loadedAdminRecord = adminDoc.data() as AdminRoleRecord;
-          }
-        } catch {
-          // Non-admin read may be denied or offline
-        }
-
-        // Bootstrap admin record and default settings if needed
-        if (isBootstrapped) {
-          try {
-            if (!loadedAdminRecord) {
-              const bootstrapAdminDoc: AdminRoleRecord = {
-                uid: user.uid,
-                email: user.email || 'retakanbumi@gmail.com',
-                name: user.displayName || 'Ketua RT',
-                role: 'ketua_rt',
-                permissions: [...ALL_RBAC_PERMISSIONS],
-              };
-              await setDoc(doc(db, 'admins', user.uid), {
-                ...bootstrapAdminDoc,
-                createdAt: serverTimestamp(),
-              });
-              loadedAdminRecord = bootstrapAdminDoc;
-            }
-            const settingsSnap = await getDoc(doc(db, 'settings', 'rt_config'));
-            if (!settingsSnap.exists()) {
-              await setDoc(doc(db, 'settings', 'rt_config'), {
-                ...DEFAULT_RT_SETTINGS,
-                updatedBy: user.uid,
-                updatedAt: serverTimestamp(),
-              });
-            }
-          } catch {
-            // Safe ignore if offline on bootstrap
-          }
-        }
-
-        const adminFlag = isBootstrapped || Boolean(loadedAdminRecord);
-
-        // Load resident directory profile (never auto-provision unregistered users)
-        const userRef = doc(db, 'users', user.uid);
-        let userSnap;
-        try {
-          userSnap = await getDoc(userRef);
-        } catch (err) {
-          handleFirestoreError(err, OperationType.GET, `users/${user.uid}`);
-        }
-
-        if (userSnap && userSnap.exists()) {
-          const data = userSnap.data() as ResidentPublic;
-          const actualRole: LoginRole = adminFlag
-            ? 'pengurus'
-            : data.accountRole || 'warga';
-
-          if (expectedLoginRoleRef.current && actualRole !== expectedLoginRoleRef.current) {
-            const expectedLabel =
-              expectedLoginRoleRef.current === 'pengurus' ? 'Pengurus' : 'Warga';
-            const actualLabel = actualRole === 'pengurus' ? 'Pengurus' : 'Warga';
-            expectedLoginRoleRef.current = null;
-            setLoginError(
-              `Role tidak sesuai. Akun ini terdaftar sebagai ${actualLabel}, bukan ${expectedLabel}.`
-            );
-            await signOut(auth);
-            setProfile(null);
-            setAdminRecord(null);
-            setIsBootstrappedAdminUser(false);
-            setAuthReady(true);
-            return;
-          }
-
-          expectedLoginRoleRef.current = null;
-          setIsBootstrappedAdminUser(isBootstrapped);
-          setAdminRecord(loadedAdminRecord);
-          setProfile(data);
-          if (typeof data.elderlyMode === 'boolean') {
-            setElderlyMode(data.elderlyMode);
-          }
-        } else if (isBootstrapped) {
-          expectedLoginRoleRef.current = null;
-          setIsBootstrappedAdminUser(true);
-          setAdminRecord(loadedAdminRecord);
-          const initialProfile: ResidentPublic = {
-            uid: user.uid,
-            accountRole: 'pengurus',
-            pengurusPosition: 'ketua_rt',
-            permissions: [...ALL_RBAC_PERMISSIONS],
-            displayName: user.displayName || 'Ketua RT',
-            houseBlock: 'FF3/5',
-            residentStatus: 'pengurus',
-            familyStatus: 'umum',
-            familyStatusLog: [`${getCurrentYearMonth()}:umum`],
-            elderlyMode: false,
-            communityId: 'rt_warga',
-          };
-          try {
-            await setDoc(userRef, {
-              ...initialProfile,
-              createdAt: serverTimestamp(),
-              updatedAt: serverTimestamp(),
-            });
-          } catch (err) {
-            handleFirestoreError(err, OperationType.CREATE, `users/${user.uid}`);
-          }
-          setProfile(initialProfile);
-          if (!localStorage.getItem(`kaswarga_seen_intro_${user.uid}`)) {
-            setShowNewUserBanner(true);
-          }
-        } else {
-          expectedLoginRoleRef.current = null;
-          setLoginError(
-            'Akun Anda belum terdaftar di Database Warga. Silakan daftarkan akun terlebih dahulu menggunakan Nama Lengkap dan Blok Rumah yang sesuai.'
-          );
-          await signOut(auth);
-          setProfile(null);
-          setAdminRecord(null);
-          setIsBootstrappedAdminUser(false);
-          setAuthReady(true);
-          return;
-        }
-
-        // Load & decrypt isolated PII & Health Profile
-        try {
-          const privProfSnap = await getDoc(doc(db, 'users', user.uid, 'private', 'profile'));
-          if (privProfSnap.exists()) {
-            const decrypted = await decryptSensitiveJson<PrivateProfileData>(
-              user.uid,
-              privProfSnap.data().encryptedPayload as string
-            );
-            if (decrypted) setPrivateProfile(decrypted);
-          }
-          const privHealthSnap = await getDoc(doc(db, 'users', user.uid, 'private', 'health'));
-          if (privHealthSnap.exists()) {
-            const decrypted = await decryptSensitiveJson<PrivateHealthData>(
-              user.uid,
-              privHealthSnap.data().encryptedPayload as string
-            );
-            if (decrypted) setHealthProfile(decrypted);
-          }
-        } catch {
-          // Offline or not yet created
-        }
-      } finally {
-        setAuthReady(true);
-      }
-    });
-
-    return () => unsubscribe();
-  }, []);
-
-  // Public Community Slideshow Listener (active on LoginScreen & Settings)
-  useEffect(() => {
-    const unsubSlides = onSnapshot(
-      query(collection(db, 'slides'), where('communityId', '==', 'rt_warga')),
-      (snap) => {
-        const list = snap.docs
-          .map((d) => ({ id: d.id, ...d.data() } as BannerSlide))
-          .sort((a, b) => (a.sortOrder ?? 0) - (b.sortOrder ?? 0));
-        setBannerSlides(list);
-        saveCachedBannerSlides(list);
-      },
-      () => {
-        // Keep cached slides silently if offline or network interrupted
-      }
-    );
-
-    return () => unsubSlides();
-  }, []);
-
-  // Real-Time Firestore Listeners
-  useEffect(() => {
-    if (!authReady || !currentUser || !profile) return;
-
-    const unsubSettings = onSnapshot(
-      doc(db, 'settings', 'rt_config'),
-      (snap) => {
-        if (snap.exists()) {
-          setRtSettings(snap.data() as RtSettings);
-        }
-      },
-      (err) => handleFirestoreError(err, OperationType.GET, 'settings/rt_config')
-    );
-
-    const unsubUsers = onSnapshot(
-      query(collection(db, 'users'), where('communityId', '==', 'rt_warga')),
-      (snap) => {
-        const list = snap.docs.map((d) => d.data() as ResidentPublic);
-        setResidents(list.sort((a, b) => a.houseBlock.localeCompare(b.houseBlock)));
-      },
-      (err) => handleFirestoreError(err, OperationType.LIST, 'users')
-    );
-
-    const unsubTransactions = onSnapshot(
-      query(collection(db, 'transactions'), where('communityId', '==', 'rt_warga')),
-      (snap) => {
-        const list = snap.docs.map(
-          (d) => ({ id: d.id, ...d.data() } as KasTransaction)
+        if (snap.rtSettings) setRtSettings(snap.rtSettings);
+        setRegistryEntries(
+          [...snap.registryEntries].sort((a, b) => a.houseBlock.localeCompare(b.houseBlock))
         );
-        setTransactions(sortByCreatedAtDesc(list));
-      },
-      (err) => handleFirestoreError(err, OperationType.LIST, 'transactions')
-    );
+        setUserAccounts(snap.userAccounts);
+        setResidents([...snap.users].sort((a, b) => a.houseBlock.localeCompare(b.houseBlock)));
+        setAdminRecords(snap.admins);
+        setPrivateDataRecords(snap.privateData);
+        setTransactions(sortByCreatedAtDesc(snap.transactions));
 
-    const unsubAnnouncements = onSnapshot(
-      query(collection(db, 'announcements'), where('communityId', '==', 'rt_warga')),
-      (snap) => {
-        const list = sortByCreatedAtDesc(
-          snap.docs.map((d) => ({ id: d.id, ...d.data() } as Announcement))
-        );
+        const sortedAnnouncements = sortByCreatedAtDesc(snap.announcements);
         if (initialAnnouncementIdsRef.current === null) {
-          initialAnnouncementIdsRef.current = new Set(list.map((a) => a.id));
+          initialAnnouncementIdsRef.current = new Set(sortedAnnouncements.map((a) => a.id));
         } else {
-          const newest = list.find((a) => !initialAnnouncementIdsRef.current?.has(a.id));
+          const newest = sortedAnnouncements.find(
+            (a) => !initialAnnouncementIdsRef.current?.has(a.id)
+          );
           if (newest) {
             initialAnnouncementIdsRef.current.add(newest.id);
             showToast(
@@ -453,21 +390,13 @@ export default function App() {
             );
           }
         }
-        setAnnouncements(list);
-      },
-      (err) => handleFirestoreError(err, OperationType.LIST, 'announcements')
-    );
+        setAnnouncements(sortedAnnouncements);
 
-    const unsubEmergencies = onSnapshot(
-      query(collection(db, 'emergencies'), where('communityId', '==', 'rt_warga')),
-      (snap) => {
-        const list = sortByCreatedAtDesc(
-          snap.docs.map((d) => ({ id: d.id, ...d.data() } as EmergencyAlert))
-        );
+        const sortedEmergencies = sortByCreatedAtDesc(snap.emergencies);
         if (initialEmergencyIdsRef.current === null) {
-          initialEmergencyIdsRef.current = new Set(list.map((e) => e.id));
+          initialEmergencyIdsRef.current = new Set(sortedEmergencies.map((e) => e.id));
         } else {
-          const newest = list.find(
+          const newest = sortedEmergencies.find(
             (e) => e.status === 'active' && !initialEmergencyIdsRef.current?.has(e.id)
           );
           if (newest) {
@@ -479,61 +408,394 @@ export default function App() {
             );
           }
         }
-        setEmergencies(list);
-      },
-      (err) => handleFirestoreError(err, OperationType.LIST, 'emergencies')
-    );
+        setEmergencies(sortedEmergencies);
 
-    const unsubNotifications = onSnapshot(
-      query(collection(db, 'notifications'), where('targetUid', '==', currentUser.uid)),
-      (snap) => {
-        const list = sortByCreatedAtDesc(
-          snap.docs.map((d) => ({ id: d.id, ...d.data() } as UserNotification))
-        );
-        if (initialNotificationIdsRef.current === null) {
-          initialNotificationIdsRef.current = new Set(list.map((n) => n.id));
-        } else {
-          const newest = list.find((n) => !n.isRead && !initialNotificationIdsRef.current?.has(n.id));
-          if (newest) {
-            initialNotificationIdsRef.current.add(newest.id);
-            showToast(newest.title, newest.message, newest.type === 'emergency');
+        const sortedNotifs = sortByCreatedAtDesc(snap.notifications);
+        if (currentUser) {
+          const myNotifs = sortedNotifs.filter((n) => n.targetUid === currentUser.uid);
+          if (initialNotificationIdsRef.current === null) {
+            initialNotificationIdsRef.current = new Set(myNotifs.map((n) => n.id));
+          } else {
+            const newest = myNotifs.find(
+              (n) => !n.isRead && !initialNotificationIdsRef.current?.has(n.id)
+            );
+            if (newest) {
+              initialNotificationIdsRef.current.add(newest.id);
+              showToast(newest.title, newest.message, newest.type === 'emergency');
+            }
           }
         }
-        setNotifications(list);
-      },
-      (err) => handleFirestoreError(err, OperationType.LIST, 'notifications')
-    );
+        setAllNotifications(sortedNotifs);
 
-    return () => {
-      unsubSettings();
-      unsubUsers();
-      unsubTransactions();
-      unsubAnnouncements();
-      unsubEmergencies();
-      unsubNotifications();
-    };
-  }, [authReady, currentUser, profile?.uid, showToast]);
+        setBannerSlides(snap.slides);
+        saveCachedBannerSlides(snap.slides);
+        setSheetInfo((prev) =>
+          prev
+            ? {
+                ...prev,
+                lastSyncedAtIso: new Date().toISOString(),
+              }
+            : prev
+        );
 
-  // Authorized Master Resident Registry Listener (Ketua RT & Sekretaris / manage_residents)
+        return snap;
+      } catch (err) {
+        if (err instanceof SheetsAuthExpiredError) {
+          handleExpiredToken();
+        } else if (!silent) {
+          setLoginError(
+            err instanceof Error
+              ? `Gagal membaca Google Spreadsheet: ${err.message}`
+              : 'Gagal membaca Google Spreadsheet.'
+          );
+        }
+        return null;
+      } finally {
+        if (!silent) setIsSyncing(false);
+      }
+    },
+    [sheetInfo?.spreadsheetId, currentUser, showToast, handleExpiredToken]
+  );
+
+  // Sync active user profile/admin changes from fresh sheet snapshots
   useEffect(() => {
-    if (!authReady || !currentUser || !profile || !rbac.canManageResidents) {
-      setRegistryEntries([]);
+    if (!currentUser) return;
+    const latestProfile = residents.find((r) => r.uid === currentUser.uid);
+    if (latestProfile) {
+      setProfile(latestProfile);
+      if (typeof latestProfile.elderlyMode === 'boolean') {
+        setElderlyMode(latestProfile.elderlyMode);
+      }
+    }
+    const latestAdmin = adminRecords.find((a) => a.uid === currentUser.uid) || null;
+    if (latestAdmin) {
+      setAdminRecord(latestAdmin);
+    }
+  }, [currentUser, residents, adminRecords]);
+
+  // Decrypt private profile & health whenever privateDataRecords or currentUser updates
+  useEffect(() => {
+    if (!currentUser) {
+      setPrivateProfile(DEFAULT_PRIVATE_PROFILE);
+      setHealthProfile(DEFAULT_HEALTH_PROFILE);
       return;
     }
 
-    const unsubRegistry = onSnapshot(
-      query(collection(db, 'resident_registry'), where('communityId', '==', 'rt_warga')),
-      (snap) => {
-        const list = snap.docs.map((d) => d.data() as ResidentRegistryEntry);
-        setRegistryEntries(list.sort((a, b) => a.houseBlock.localeCompare(b.houseBlock)));
+    let cancelled = false;
+    const loadPrivate = async () => {
+      const profRec = privateDataRecords.find(
+        (p) => p.uid === currentUser.uid && p.docType === 'profile'
+      );
+      if (profRec?.encryptedPayload) {
+        const decrypted = await decryptSensitiveJson<PrivateProfileData>(
+          currentUser.uid,
+          profRec.encryptedPayload
+        );
+        if (!cancelled && decrypted) setPrivateProfile(decrypted);
+      } else if (!cancelled) {
+        setPrivateProfile(DEFAULT_PRIVATE_PROFILE);
+      }
+
+      const healthRec = privateDataRecords.find(
+        (p) => p.uid === currentUser.uid && p.docType === 'health'
+      );
+      if (healthRec?.encryptedPayload) {
+        const decrypted = await decryptSensitiveJson<PrivateHealthData>(
+          currentUser.uid,
+          healthRec.encryptedPayload
+        );
+        if (!cancelled && decrypted) setHealthProfile(decrypted);
+      } else if (!cancelled) {
+        setHealthProfile(DEFAULT_HEALTH_PROFILE);
+      }
+    };
+
+    void loadPrivate();
+    return () => {
+      cancelled = true;
+    };
+  }, [currentUser, privateDataRecords]);
+
+  // Initialize Google Workspace OAuth listener (token strictly in memory)
+  useEffect(() => {
+    const unsubscribe = initGoogleAuth(
+      (user, token) => {
+        setGoogleConnected(true);
+        setGoogleUserEmail(user.email || null);
+        setGoogleDisplayName(user.displayName || null);
+        setGoogleUid(user.uid);
+        setAuthReady(true);
+        const savedId = getSavedSpreadsheetId();
+        if (savedId && !sheetInfo) {
+          void (async () => {
+            try {
+              const info = await connectAndEnsureSchema(token, savedId, DEFAULT_RT_SETTINGS);
+              setSheetInfo(info);
+              await refreshSpreadsheetData(token, info.spreadsheetId, true);
+            } catch {
+              // User can re-select spreadsheet
+            }
+          })();
+        }
       },
-      (err) => handleFirestoreError(err, OperationType.LIST, 'resident_registry')
+      (user) => {
+        setGoogleConnected(false);
+        setGoogleUserEmail(user?.email || null);
+        setGoogleDisplayName(user?.displayName || null);
+        setGoogleUid(user?.uid || null);
+        setCurrentUser(null);
+        setProfile(null);
+        setAdminRecord(null);
+        setIsBootstrappedAdminUser(false);
+        setAuthReady(true);
+      }
     );
 
-    return () => unsubRegistry();
-  }, [authReady, currentUser, profile?.uid, rbac.canManageResidents]);
+    return () => unsubscribe();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
-  // Keep offline emergency snapshot up-to-date
+  // Periodic background polling of Google Spreadsheet (single batchGet every 25s)
+  useEffect(() => {
+    if (!googleConnected || !sheetInfo?.spreadsheetId || !isOnline) return;
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === 'visible' && !isMutatingRef.current) {
+        void refreshSpreadsheetData(undefined, undefined, true);
+      }
+    }, 25000);
+    return () => window.clearInterval(timer);
+  }, [googleConnected, sheetInfo?.spreadsheetId, isOnline, refreshSpreadsheetData]);
+
+  // Connect Google account + auto-discover or connect saved Google Spreadsheet
+  const handleGoogleConnect = useCallback(async () => {
+    setIsConnectingSheet(true);
+    setLoginError(null);
+    try {
+      const { user, accessToken } = await googleWorkspaceSignIn();
+      setGoogleConnected(true);
+      setGoogleUserEmail(user.email || null);
+      setGoogleDisplayName(user.displayName || null);
+      setGoogleUid(user.uid);
+
+      const savedId = getSavedSpreadsheetId();
+      if (savedId) {
+        try {
+          const info = await connectAndEnsureSchema(accessToken, savedId, DEFAULT_RT_SETTINGS);
+          setSheetInfo(info);
+          await refreshSpreadsheetData(accessToken, info.spreadsheetId, true);
+          return;
+        } catch {
+          clearSavedSpreadsheetId();
+        }
+      }
+
+      const discovered = await findAppDatabaseSpreadsheet(accessToken);
+      if (discovered) {
+        const info = await connectAndEnsureSchema(
+          accessToken,
+          discovered.spreadsheetId,
+          DEFAULT_RT_SETTINGS
+        );
+        setSheetInfo(info);
+        await refreshSpreadsheetData(accessToken, info.spreadsheetId, true);
+      } else {
+        setSheetInfo(null);
+      }
+    } catch (err) {
+      const code = (err as { code?: string })?.code || '';
+      const rawMessage = err instanceof Error ? err.message : '';
+      if (code === 'auth/unauthorized-domain' || rawMessage.includes('auth/unauthorized-domain')) {
+        const host = typeof window !== 'undefined' ? window.location.hostname : '';
+        setLoginError(
+          `Domain "${host}" belum terdaftar di Authorized Domains Google/Firebase Console. Tambahkan "${host}" atau muat ulang halaman.`
+        );
+      } else if (code === 'auth/popup-blocked') {
+        setLoginError(
+          'Pop-up login Google diblokir oleh browser. Mohon izinkan pop-up untuk situs ini lalu coba lagi.'
+        );
+      } else if (code === 'auth/popup-closed-by-user') {
+        setLoginError('Jendela login Google ditutup sebelum selesai. Silakan coba lagi.');
+      } else {
+        setLoginError(
+          err instanceof Error
+            ? `Gagal menghubungkan Google Sheets: ${err.message}`
+            : 'Gagal menghubungkan akun Google.'
+        );
+      }
+    } finally {
+      setIsConnectingSheet(false);
+    }
+  }, [refreshSpreadsheetData]);
+
+  const handleGoogleDisconnect = useCallback(async () => {
+    setSettingsOpen(false);
+    setRegistryOpen(false);
+    await googleWorkspaceSignOut();
+    setGoogleConnected(false);
+    setGoogleUserEmail(null);
+    setGoogleDisplayName(null);
+    setGoogleUid(null);
+    setSheetInfo(null);
+    setCurrentUser(null);
+    setProfile(null);
+    setAdminRecord(null);
+    setIsBootstrappedAdminUser(false);
+  }, []);
+
+  const handleCreateSpreadsheet = useCallback(async () => {
+    if (!currentUser || !rbac.isFullAdmin) {
+      const msg =
+        'Pembuatan database Google Spreadsheet hanya dapat dilakukan setelah Admin (Ketua RT) login ke aplikasi.';
+      setLoginError(msg);
+      showToast('Akses Ditolak', msg, true);
+      return;
+    }
+
+    const token = getGoogleAccessToken();
+    if (!token) {
+      handleExpiredToken();
+      return;
+    }
+
+    const confirmed = await requestSheetConfirmation({
+      title: 'Buat Database Google Spreadsheet Baru',
+      description:
+        'Aplikasi akan membuat file Google Spreadsheet baru bernama "DATABASE_SISKEU_RT12_RW20" di Google Drive Anda beserta seluruh tab tabel RT berbahasa Indonesia.',
+      details: [
+        'Tab dibuat: pengaturan, database_warga, akun_pengguna, profil_warga, pengurus_admin, data_pribadi, transaksi_kas, pengumuman, darurat_sos, notifikasi, foto_kegiatan',
+      ],
+      confirmLabel: 'Buat Spreadsheet',
+    });
+    if (!confirmed) return;
+
+    setIsConnectingSheet(true);
+    setLoginError(null);
+    try {
+      const info = await createAppDatabaseSpreadsheet(token, DEFAULT_RT_SETTINGS);
+      const nowIso = new Date().toISOString();
+      const adminToSeed: AdminRoleRecord = adminRecord || {
+        uid: currentUser.uid,
+        email: googleUserEmail || currentUser.email || 'admin@siskeurt12.id',
+        name: profile?.displayName || googleDisplayName || 'Ketua RT',
+        role: 'ketua_rt',
+        permissions: [...ALL_RBAC_PERMISSIONS],
+        createdAt: nowIso,
+      };
+      const profileToSeed: ResidentPublic = profile || {
+        uid: currentUser.uid,
+        accountRole: 'pengurus',
+        pengurusPosition: 'ketua_rt',
+        permissions: [...ALL_RBAC_PERMISSIONS],
+        displayName: googleDisplayName || 'Ketua RT',
+        houseBlock: 'FF3/5',
+        residentStatus: 'pengurus',
+        familyStatus: 'umum',
+        familyStatusLog: [`${getCurrentYearMonth()}:umum`],
+        elderlyMode: false,
+        communityId: 'rt_warga',
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      };
+
+      await Promise.all([
+        upsertSheetRowsByKey(token, info.spreadsheetId, SHEET_TABS.ADMINS, [
+          adminRecordToRow(adminToSeed),
+        ]),
+        upsertSheetRowsByKey(token, info.spreadsheetId, SHEET_TABS.USERS, [
+          userProfileToRow(profileToSeed),
+        ]),
+      ]);
+
+      setSheetInfo(info);
+      setAdminRecord(adminToSeed);
+      setProfile(profileToSeed);
+      await refreshSpreadsheetData(token, info.spreadsheetId, true);
+      showToast(
+        'Google Spreadsheet Siap',
+        `Database "${info.spreadsheetTitle}" berhasil dibuat dan terhubung.`
+      );
+    } catch (err) {
+      if (err instanceof SheetsAuthExpiredError) {
+        handleExpiredToken();
+      } else {
+        const msg =
+          err instanceof Error
+            ? `Gagal membuat Spreadsheet: ${err.message}`
+            : 'Gagal membuat Spreadsheet.';
+        setLoginError(msg);
+        showToast('Gagal Membuat Spreadsheet', msg, true);
+      }
+    } finally {
+      setIsConnectingSheet(false);
+    }
+  }, [
+    currentUser,
+    rbac.isFullAdmin,
+    adminRecord,
+    profile,
+    googleUserEmail,
+    googleDisplayName,
+    requestSheetConfirmation,
+    refreshSpreadsheetData,
+    showToast,
+    handleExpiredToken,
+  ]);
+
+  const handleConnectSpreadsheetById = useCallback(
+    async (idOrUrl: string) => {
+      const token = getGoogleAccessToken();
+      if (!token) {
+        const msg = 'Hubungkan akun Google terlebih dahulu.';
+        setLoginError(msg);
+        showToast('Google Belum Terhubung', msg, true);
+        return;
+      }
+      const spreadsheetId = extractSpreadsheetId(idOrUrl);
+      if (!spreadsheetId) {
+        const msg = 'Masukkan URL atau ID Google Spreadsheet yang valid.';
+        setLoginError(msg);
+        showToast('URL/ID Tidak Valid', msg, true);
+        return;
+      }
+
+      const confirmed = await requestSheetConfirmation({
+        title: 'Hubungkan & Siapkan Struktur Spreadsheet',
+        description:
+          'Aplikasi akan memeriksa tab database yang diperlukan pada Google Spreadsheet tersebut dan menambahkan header tabel yang belum ada.',
+        details: [`Spreadsheet ID: ${spreadsheetId}`],
+        confirmLabel: 'Hubungkan Spreadsheet',
+      });
+      if (!confirmed) return;
+
+      setIsConnectingSheet(true);
+      setLoginError(null);
+      try {
+        const info = await connectAndEnsureSchema(token, spreadsheetId, DEFAULT_RT_SETTINGS);
+        setSheetInfo(info);
+        await refreshSpreadsheetData(token, info.spreadsheetId, true);
+        showToast(
+          'Spreadsheet Terhubung',
+          `Berhasil terhubung ke "${info.spreadsheetTitle}".`
+        );
+      } catch (err) {
+        if (err instanceof SheetsAuthExpiredError) {
+          handleExpiredToken();
+        } else {
+          const msg =
+            err instanceof Error
+              ? `Gagal membuka Spreadsheet: ${err.message}`
+              : 'Gagal membuka Spreadsheet.';
+          setLoginError(msg);
+          showToast('Gagal Membuka Spreadsheet', msg, true);
+        }
+      } finally {
+        setIsConnectingSheet(false);
+      }
+    },
+    [requestSheetConfirmation, refreshSpreadsheetData, showToast, handleExpiredToken]
+  );
+
+  // Offline emergency snapshot
   useEffect(() => {
     if (!profile) return;
     const summaryParts = [
@@ -560,48 +822,80 @@ export default function App() {
     });
   }, [profile, healthProfile, privateProfile, rtSettings, transactions, emergencies]);
 
-  // Auto-sync offline queue when connectivity restores
+  // Auto-sync offline queue to Google Sheets when back online
   const flushOfflineQueue = useCallback(async () => {
-    if (!isOnline || !currentUser || !profile) return;
+    const token = getGoogleAccessToken();
+    if (!isOnline || !currentUser || !profile || !token || !sheetInfo?.spreadsheetId) return;
     const queue = getOfflineQueue();
     if (queue.length === 0) return;
 
+    const confirmed = await requestSheetConfirmation({
+      title: 'Sinkronkan Data Mode Offline ke Google Spreadsheet',
+      description: `Terdapat ${queue.length} catatan offline yang siap disimpan ke Google Spreadsheet "${sheetInfo.spreadsheetTitle}".`,
+      details: queue.map((q) =>
+        q.kind === 'dues_submission'
+          ? `Iuran: ${(q.payload as { title?: string }).title || 'Pembayaran'}`
+          : `Darurat SOS: ${(q.payload as { emergencyType?: string }).emergencyType || 'Laporan'}`
+      ),
+      confirmLabel: 'Sinkronkan Sekarang',
+    });
+    if (!confirmed) return;
+
     let syncedCount = 0;
+    const nowIso = new Date().toISOString();
     for (const item of queue) {
       try {
         if (item.kind === 'dues_submission') {
-          await addDoc(collection(db, 'transactions'), {
-            ...item.payload,
-            createdAt: serverTimestamp(),
-            updatedAt: serverTimestamp(),
-          });
+          const tx: KasTransaction = {
+            id: generateRecordId('tx'),
+            ...(item.payload as Omit<KasTransaction, 'id'>),
+            createdAt: item.createdAtIso || nowIso,
+            updatedAt: nowIso,
+          };
+          await appendSheetRows(token, sheetInfo.spreadsheetId, SHEET_TABS.TRANSACTIONS, [
+            transactionToRow(tx),
+          ]);
           removeOfflineAction(item.localId);
           syncedCount++;
         } else if (item.kind === 'emergency_alert') {
-          await addDoc(collection(db, 'emergencies'), {
-            ...item.payload,
-            createdAt: serverTimestamp(),
-            updatedAt: serverTimestamp(),
-          });
+          const em: EmergencyAlert = {
+            id: generateRecordId('em'),
+            ...(item.payload as Omit<EmergencyAlert, 'id'>),
+            createdAt: item.createdAtIso || nowIso,
+            updatedAt: nowIso,
+          };
+          await appendSheetRows(token, sheetInfo.spreadsheetId, SHEET_TABS.EMERGENCIES, [
+            emergencyToRow(em),
+          ]);
           removeOfflineAction(item.localId);
           syncedCount++;
         }
-      } catch {
-        // Leave in queue if sync failed
+      } catch (err) {
+        if (err instanceof SheetsAuthExpiredError) {
+          handleExpiredToken();
+          break;
+        }
       }
     }
     setOfflineQueueCount(getOfflineQueue().length);
     if (syncedCount > 0) {
+      await refreshSpreadsheetData(token, sheetInfo.spreadsheetId, true);
       showToast(
         'Sinkronisasi Otomatis Berhasil',
-        `${syncedCount} data dari mode offline telah tersinkron ke cloud.`
+        `${syncedCount} data dari mode offline telah tersimpan ke Google Spreadsheet.`
       );
     }
-  }, [isOnline, currentUser, profile, showToast]);
-
-  useEffect(() => {
-    void flushOfflineQueue();
-  }, [flushOfflineQueue]);
+  }, [
+    isOnline,
+    currentUser,
+    profile,
+    sheetInfo?.spreadsheetId,
+    sheetInfo?.spreadsheetTitle,
+    requestSheetConfirmation,
+    refreshSpreadsheetData,
+    showToast,
+    handleExpiredToken,
+  ]);
 
   const handleLoginWithCredentials = async (data: {
     role: LoginRole;
@@ -613,20 +907,36 @@ export default function App() {
     const normalizedUsername = normalizeUsername(data.username);
 
     try {
-      if (!isValidUsername(normalizedUsername)) {
-        setLoginError('Format username tidak valid. Gunakan 3–30 karakter huruf, angka, _ atau -.');
-        return;
-      }
-
-      const accSnap = await getDoc(doc(db, 'user_accounts', normalizedUsername));
-      if (!accSnap.exists()) {
+      const token = getGoogleAccessToken();
+      if (!token || !sheetInfo?.spreadsheetId) {
         setLoginError(
-          `Username "${normalizedUsername}" belum terdaftar. Wajib mendaftarkan akun terlebih dahulu pada tab Daftar Akun.`
+          'Hubungkan akun Google dan Google Spreadsheet terlebih dahulu pada panel di atas.'
         );
         return;
       }
 
-      const accData = accSnap.data() as UserAccountLookup;
+      if (!isValidUsername(normalizedUsername)) {
+        setLoginError(
+          'Format username tidak valid. Gunakan 3–30 karakter huruf, angka, _ atau -.'
+        );
+        return;
+      }
+
+      const freshSnap = await refreshSpreadsheetData(token, sheetInfo.spreadsheetId, true);
+      const activeAccounts = freshSnap?.userAccounts || userAccounts;
+      const activeUsers = freshSnap?.users || residents;
+      const activeAdmins = freshSnap?.admins || adminRecords;
+
+      const accData = activeAccounts.find(
+        (a) => normalizeUsername(a.username) === normalizedUsername
+      );
+      if (!accData) {
+        setLoginError(
+          `Username "${normalizedUsername}" belum terdaftar di Google Spreadsheet. Wajib mendaftarkan akun terlebih dahulu pada tab Daftar Akun.`
+        );
+        return;
+      }
+
       if (accData.role !== data.role) {
         setLoginError(
           `Role tidak sesuai. Username "${normalizedUsername}" terdaftar sebagai ${
@@ -636,32 +946,78 @@ export default function App() {
         return;
       }
 
-      expectedLoginRoleRef.current = data.role;
-      await signInWithEmailAndPassword(
-        auth,
-        usernameToAuthEmail(normalizedUsername),
-        data.password
-      );
-    } catch (err) {
-      expectedLoginRoleRef.current = null;
-      const code = (err as { code?: string })?.code || '';
-      if (
-        code === 'auth/invalid-credential' ||
-        code === 'auth/wrong-password' ||
-        code === 'auth/user-not-found'
-      ) {
-        setLoginError('Username atau sandi salah. Silakan periksa kembali.');
-      } else if (code === 'auth/operation-not-allowed') {
+      if (!accData.passwordHash) {
         setLoginError(
-          'Metode login Email/Password belum diaktifkan di Firebase Console. Admin dapat mengaktifkannya di Authentication → Sign-in method → Email/Password.'
+          'Akun ini belum memiliki hash sandi di Spreadsheet. Pengurus dapat mereset klaim akun pada Database Warga agar Anda bisa mendaftar ulang.'
         );
-      } else if (code === 'auth/too-many-requests') {
-        setLoginError('Terlalu banyak percobaan gagal. Mohon tunggu beberapa menit lalu coba lagi.');
-      } else {
-        setLoginError(
-          err instanceof Error ? `Gagal masuk: ${err.message}` : 'Gagal masuk ke sistem.'
-        );
+        return;
       }
+
+      const passwordValid = await verifyPassword(data.password, accData.passwordHash);
+      if (!passwordValid) {
+        setLoginError('Username atau sandi salah. Silakan periksa kembali.');
+        return;
+      }
+
+      const matchedAdmin = activeAdmins.find((a) => a.uid === accData.uid) || null;
+      let userProf = activeUsers.find((u) => u.uid === accData.uid) || null;
+      if (!userProf && matchedAdmin?.role === 'ketua_rt') {
+        const nowIso = new Date().toISOString();
+        userProf = {
+          uid: accData.uid,
+          username: normalizedUsername,
+          accountRole: 'pengurus',
+          pengurusPosition: 'ketua_rt',
+          permissions: [...ALL_RBAC_PERMISSIONS],
+          displayName: matchedAdmin.name || 'Ketua RT',
+          houseBlock: 'FF3/5',
+          residentStatus: 'pengurus',
+          familyStatus: 'umum',
+          familyStatusLog: [`${getCurrentYearMonth()}:umum`],
+          elderlyMode: false,
+          communityId: 'rt_warga',
+          createdAt: matchedAdmin.createdAt || nowIso,
+          updatedAt: nowIso,
+        };
+      }
+      if (!userProf) {
+        setLoginError(
+          'Profil pengguna tidak ditemukan di tab "profil_warga" Google Spreadsheet. Hubungi Pengurus RT.'
+        );
+        return;
+      }
+
+      const actualRole: LoginRole = matchedAdmin
+        ? 'pengurus'
+        : userProf.accountRole || 'warga';
+
+      if (actualRole !== data.role) {
+        setLoginError(
+          `Role tidak sesuai. Akun ini terdaftar sebagai ${
+            actualRole === 'pengurus' ? 'Pengurus' : 'Warga'
+          }, bukan ${data.role === 'pengurus' ? 'Pengurus' : 'Warga'}.`
+        );
+        return;
+      }
+
+      setIsBootstrappedAdminUser(false);
+      setAdminRecord(matchedAdmin);
+      setProfile(userProf);
+      if (typeof userProf.elderlyMode === 'boolean') {
+        setElderlyMode(userProf.elderlyMode);
+      }
+      setCurrentUser({
+        uid: userProf.uid,
+        email: usernameToAuthEmail(normalizedUsername),
+        displayName: userProf.displayName,
+        username: normalizedUsername,
+        role: actualRole,
+      });
+      initialNotificationIdsRef.current = null;
+    } catch (err) {
+      setLoginError(
+        err instanceof Error ? `Gagal masuk: ${err.message}` : 'Gagal masuk ke sistem.'
+      );
     } finally {
       setIsLoggingIn(false);
     }
@@ -673,7 +1029,12 @@ export default function App() {
     houseBlock: string;
     username: string;
     password: string;
-  }) => {
+  }): Promise<{
+    role: LoginRole;
+    username: string;
+    fullName: string;
+    pengurusPosition?: PengurusPosition;
+  } | null> => {
     setIsLoggingIn(true);
     setLoginError(null);
 
@@ -681,29 +1042,39 @@ export default function App() {
     if (!isValidUsername(normalizedUsername)) {
       setLoginError('Username harus 3–30 karakter (huruf kecil, angka, _ atau -).');
       setIsLoggingIn(false);
-      return;
+      return null;
     }
 
     try {
-      const registryId = await computeResidentRegistryId(data.fullName, data.houseBlock);
-      const regRef = doc(db, 'resident_registry', registryId);
-      const regSnap = await getDoc(regRef);
-
-      if (!regSnap.exists()) {
+      const token = getGoogleAccessToken();
+      if (!token || !sheetInfo?.spreadsheetId) {
         setLoginError(
-          'Pendaftaran ditolak: Nama Lengkap atau Blok Rumah tidak sesuai dengan database warga RT 12 / RW 20. Hubungi Pengurus RT untuk memastikan data warga Anda terdaftar.'
+          'Hubungkan akun Google dan Google Spreadsheet terlebih dahulu sebelum mendaftarkan akun.'
         );
-        return;
+        return null;
       }
 
-      const reg = regSnap.data() as ResidentRegistryEntry;
+      const freshSnap = await refreshSpreadsheetData(token, sheetInfo.spreadsheetId, true);
+      const activeRegistry = freshSnap?.registryEntries || registryEntries;
+      const activeAccounts = freshSnap?.userAccounts || userAccounts;
+
+      const registryId = await computeResidentRegistryId(data.fullName, data.houseBlock);
+      const reg = activeRegistry.find((e) => e.registryId === registryId);
+
+      if (!reg) {
+        setLoginError(
+          'Pendaftaran ditolak: Nama Lengkap atau Blok Rumah tidak sesuai dengan database warga di Google Spreadsheet. Hubungi Pengurus RT untuk memastikan data warga Anda terdaftar.'
+        );
+        return null;
+      }
+
       if (reg.role !== data.role) {
         setLoginError(
           `Pendaftaran ditolak: Data warga Anda terdaftar sebagai ${
             reg.role === 'pengurus' ? 'Pengurus' : 'Warga'
           }, bukan ${data.role === 'pengurus' ? 'Pengurus' : 'Warga'}.`
         );
-        return;
+        return null;
       }
 
       if (reg.claimedUid) {
@@ -712,116 +1083,133 @@ export default function App() {
             reg.claimedUsername || '-'
           }". Silakan langsung masuk.`
         );
-        return;
+        return null;
       }
 
-      const accRef = doc(db, 'user_accounts', normalizedUsername);
-      const accSnap = await getDoc(accRef);
-      if (accSnap.exists()) {
-        setLoginError(`Username "${normalizedUsername}" sudah digunakan. Silakan pilih username lain.`);
-        return;
-      }
-
-      isRegisteringRef.current = true;
-      const syntheticEmail = usernameToAuthEmail(normalizedUsername);
-      const cred = await createUserWithEmailAndPassword(auth, syntheticEmail, data.password);
-
-      try {
-        await updateProfile(cred.user, { displayName: reg.fullName });
-
-        const batch = writeBatch(db);
-        batch.set(accRef, {
-          uid: cred.user.uid,
-          username: normalizedUsername,
-          role: reg.role,
-          registryId,
-          createdAt: serverTimestamp(),
-        });
-
-        const regPosition: PengurusPosition = reg.pengurusPosition || 'pengurus_lain';
-        const hasExplicitRegPerms = Array.isArray(reg.permissions);
-        const newProfile: ResidentPublic = {
-          uid: cred.user.uid,
-          username: normalizedUsername,
-          accountRole: reg.role,
-          ...(reg.role === 'pengurus'
-            ? {
-                pengurusPosition: regPosition,
-                ...(hasExplicitRegPerms ? { permissions: reg.permissions } : {}),
-              }
-            : {}),
-          registryId,
-          displayName: reg.fullName,
-          houseBlock: reg.houseBlock,
-          residentStatus: reg.residentStatus || (reg.role === 'pengurus' ? 'pengurus' : 'tetap'),
-          familyStatus: reg.familyStatus || 'umum',
-          familyStatusLog: [`${getCurrentYearMonth()}:${reg.familyStatus || 'umum'}`],
-          elderlyMode: false,
-          communityId: 'rt_warga',
-        };
-
-        batch.set(doc(db, 'users', cred.user.uid), {
-          ...newProfile,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
-
-        batch.update(regRef, {
-          claimedUid: cred.user.uid,
-          claimedUsername: normalizedUsername,
-          updatedAt: serverTimestamp(),
-        });
-
-        let createdAdminRecord: AdminRoleRecord | null = null;
-        if (reg.role === 'pengurus') {
-          createdAdminRecord = {
-            uid: cred.user.uid,
-            email: syntheticEmail,
-            name: reg.fullName,
-            role: regPosition,
-            ...(hasExplicitRegPerms ? { permissions: reg.permissions } : {}),
-            registryId,
-          };
-          batch.set(doc(db, 'admins', cred.user.uid), {
-            ...createdAdminRecord,
-            createdAt: serverTimestamp(),
-          });
-        }
-
-        await batch.commit();
-
-        setIsBootstrappedAdminUser(false);
-        setAdminRecord(createdAdminRecord);
-        setProfile(newProfile);
-        setCurrentUser(cred.user);
-        setAuthReady(true);
-        if (!localStorage.getItem(`kaswarga_seen_intro_${cred.user.uid}`)) {
-          setShowNewUserBanner(true);
-        }
-      } catch (batchErr) {
-        await cred.user.delete().catch(() => {});
-        await signOut(auth).catch(() => {});
-        throw batchErr;
-      } finally {
-        isRegisteringRef.current = false;
-      }
-    } catch (err) {
-      isRegisteringRef.current = false;
-      const code = (err as { code?: string })?.code || '';
-      if (code === 'auth/email-already-in-use') {
-        setLoginError(`Username "${normalizedUsername}" sudah terdaftar. Silakan gunakan username lain atau langsung masuk.`);
-      } else if (code === 'auth/weak-password') {
-        setLoginError('Sandi terlalu lemah. Gunakan minimal 6 karakter.');
-      } else if (code === 'auth/operation-not-allowed') {
+      const existingAccount = activeAccounts.find(
+        (a) => normalizeUsername(a.username) === normalizedUsername
+      );
+      if (existingAccount) {
         setLoginError(
-          'Pendaftaran gagal karena Email/Password belum diaktifkan di Firebase Console (Authentication → Sign-in method → Email/Password).'
+          `Username "${normalizedUsername}" sudah digunakan. Silakan pilih username lain.`
         );
+        return null;
+      }
+
+      const confirmed = await requestSheetConfirmation({
+        title: 'Konfirmasi Pendaftaran Akun ke Google Spreadsheet',
+        description: `Simpan pendaftaran akun ${
+          reg.role === 'pengurus' ? 'Pengurus' : 'Warga'
+        } atas nama "${reg.fullName}" (${reg.houseBlock}) ke Google Spreadsheet "${
+          sheetInfo.spreadsheetTitle
+        }"?`,
+        details: [
+          `Username: @${normalizedUsername}`,
+          `Tab diperbarui: ${SHEET_TABS.USER_ACCOUNTS}, ${SHEET_TABS.USERS}, ${SHEET_TABS.RESIDENT_REGISTRY}${
+            reg.role === 'pengurus' ? `, ${SHEET_TABS.ADMINS}` : ''
+          }`,
+        ],
+        confirmLabel: 'Konfirmasi & Daftar',
+      });
+      if (!confirmed) return null;
+
+      isMutatingRef.current = true;
+      const newUid = generateRecordId('usr');
+      const nowIso = new Date().toISOString();
+      const passwordHash = await hashPassword(data.password);
+      const regPosition: PengurusPosition = reg.pengurusPosition || 'pengurus_lain';
+      const hasExplicitRegPerms = Array.isArray(reg.permissions);
+
+      const accountLookup: UserAccountLookup = {
+        uid: newUid,
+        username: normalizedUsername,
+        role: reg.role,
+        registryId,
+        passwordHash,
+        createdAt: nowIso,
+      };
+
+      const newProfile: ResidentPublic = {
+        uid: newUid,
+        username: normalizedUsername,
+        accountRole: reg.role,
+        ...(reg.role === 'pengurus'
+          ? {
+              pengurusPosition: regPosition,
+              ...(hasExplicitRegPerms ? { permissions: reg.permissions } : {}),
+            }
+          : {}),
+        registryId,
+        displayName: reg.fullName,
+        houseBlock: reg.houseBlock,
+        residentStatus: reg.residentStatus || (reg.role === 'pengurus' ? 'pengurus' : 'tetap'),
+        familyStatus: reg.familyStatus || 'umum',
+        familyStatusLog: [`${getCurrentYearMonth()}:${reg.familyStatus || 'umum'}`],
+        elderlyMode: false,
+        communityId: 'rt_warga',
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      };
+
+      const updatedRegistry: ResidentRegistryEntry = {
+        ...reg,
+        claimedUid: newUid,
+        claimedUsername: normalizedUsername,
+        updatedAt: nowIso,
+      };
+
+      await Promise.all([
+        upsertSheetRowsByKey(token, sheetInfo.spreadsheetId, SHEET_TABS.USER_ACCOUNTS, [
+          userAccountToRow(accountLookup),
+        ]),
+        upsertSheetRowsByKey(token, sheetInfo.spreadsheetId, SHEET_TABS.USERS, [
+          userProfileToRow(newProfile),
+        ]),
+        upsertSheetRowsByKey(token, sheetInfo.spreadsheetId, SHEET_TABS.RESIDENT_REGISTRY, [
+          registryEntryToRow(updatedRegistry),
+        ]),
+        ...(reg.role === 'pengurus'
+          ? [
+              upsertSheetRowsByKey(token, sheetInfo.spreadsheetId, SHEET_TABS.ADMINS, [
+                adminRecordToRow({
+                  uid: newUid,
+                  email: usernameToAuthEmail(normalizedUsername),
+                  name: reg.fullName,
+                  role: regPosition,
+                  ...(hasExplicitRegPerms ? { permissions: reg.permissions } : {}),
+                  registryId,
+                  createdAt: nowIso,
+                }),
+              ]),
+            ]
+          : []),
+      ]);
+
+      await refreshSpreadsheetData(token, sheetInfo.spreadsheetId, true);
+
+      // Remain on LoginScreen so role-matched login popup appears cleanly
+      setIsBootstrappedAdminUser(false);
+      setAdminRecord(null);
+      setProfile(null);
+      setCurrentUser(null);
+
+      return {
+        role: reg.role,
+        username: normalizedUsername,
+        fullName: reg.fullName,
+        pengurusPosition: reg.role === 'pengurus' ? regPosition : undefined,
+      };
+    } catch (err) {
+      if (err instanceof SheetsAuthExpiredError) {
+        handleExpiredToken();
       } else {
         setLoginError(
           err instanceof Error ? `Pendaftaran ditolak: ${err.message}` : 'Pendaftaran akun gagal.'
         );
       }
+      return null;
     } finally {
+      isMutatingRef.current = false;
       setIsLoggingIn(false);
     }
   };
@@ -829,32 +1217,149 @@ export default function App() {
   const handleGoogleAdminLogin = async () => {
     setIsLoggingIn(true);
     setLoginError(null);
-    expectedLoginRoleRef.current = 'pengurus';
     try {
-      await signInWithPopup(auth, googleProvider);
+      let token = getGoogleAccessToken();
+      let activeUid = googleUid;
+      let activeEmail = googleUserEmail;
+      let activeDisplayName = googleDisplayName;
+
+      if (!token || !activeUid) {
+        const authResult = await googleWorkspaceSignIn();
+        token = authResult.accessToken;
+        activeUid = authResult.user.uid;
+        activeEmail = authResult.user.email || null;
+        activeDisplayName = authResult.user.displayName || null;
+        setGoogleConnected(true);
+        setGoogleUserEmail(activeEmail);
+        setGoogleDisplayName(activeDisplayName);
+        setGoogleUid(activeUid);
+      }
+
+      let activeSheet = sheetInfo;
+      if (!activeSheet?.spreadsheetId) {
+        const savedId = getSavedSpreadsheetId();
+        if (savedId) {
+          try {
+            activeSheet = await connectAndEnsureSchema(token, savedId, DEFAULT_RT_SETTINGS);
+            setSheetInfo(activeSheet);
+          } catch {
+            clearSavedSpreadsheetId();
+          }
+        }
+        if (!activeSheet?.spreadsheetId) {
+          const discovered = await findAppDatabaseSpreadsheet(token);
+          if (discovered) {
+            activeSheet = await connectAndEnsureSchema(
+              token,
+              discovered.spreadsheetId,
+              DEFAULT_RT_SETTINGS
+            );
+            setSheetInfo(activeSheet);
+          }
+        }
+      }
+
+      const emailLower = (activeEmail || '').toLowerCase();
+      const isBootstrappedEmail = BOOTSTRAPPED_ADMIN_EMAILS.includes(emailLower);
+
+      let activeAdmins = adminRecords;
+      let activeUsers = residents;
+      let activeRegistry = registryEntries;
+
+      if (activeSheet?.spreadsheetId) {
+        const freshSnap = await refreshSpreadsheetData(token, activeSheet.spreadsheetId, true);
+        if (freshSnap) {
+          activeAdmins = freshSnap.admins;
+          activeUsers = freshSnap.users;
+          activeRegistry = freshSnap.registryEntries;
+        }
+      }
+
+      const existingAdmin =
+        activeAdmins.find(
+          (a) => a.uid === activeUid || a.email.toLowerCase() === emailLower
+        ) || null;
+      const isEmptyDatabase =
+        Boolean(activeSheet?.spreadsheetId) &&
+        activeUsers.length === 0 &&
+        activeRegistry.length === 0;
+
+      if (!activeSheet?.spreadsheetId && !isBootstrappedEmail) {
+        setLoginError(
+          'Database Spreadsheet belum dibuat dan akun Google ini bukan Admin Utama. Tempel URL/ID Spreadsheet RT yang sudah ada atau masuk menggunakan akun Google Admin Utama (Ketua RT).'
+        );
+        return;
+      }
+
+      if (activeSheet?.spreadsheetId && !isBootstrappedEmail && !existingAdmin && !isEmptyDatabase) {
+        setLoginError(
+          'Akun Google ini belum terdaftar sebagai Admin Pengurus di Spreadsheet. Silakan masuk menggunakan Username & Sandi Pengurus atau minta Ketua RT menambahkan data Anda.'
+        );
+        return;
+      }
+
+      const targetUid = existingAdmin?.uid || activeUid;
+      const nowIso = new Date().toISOString();
+      const finalAdmin: AdminRoleRecord = existingAdmin || {
+        uid: targetUid,
+        email: activeEmail || 'admin@siskeurt12.id',
+        name: activeDisplayName || 'Ketua RT',
+        role: 'ketua_rt',
+        permissions: [...ALL_RBAC_PERMISSIONS],
+        createdAt: nowIso,
+      };
+      const resolvedPosition: PengurusPosition =
+        finalAdmin.role === 'admin' || !finalAdmin.role ? 'ketua_rt' : finalAdmin.role;
+      const userProf: ResidentPublic = activeUsers.find((u) => u.uid === targetUid) || {
+        uid: targetUid,
+        accountRole: 'pengurus',
+        pengurusPosition: resolvedPosition,
+        permissions: finalAdmin.permissions || [...ALL_RBAC_PERMISSIONS],
+        displayName: finalAdmin.name || activeDisplayName || 'Ketua RT',
+        houseBlock: 'FF3/5',
+        residentStatus: 'pengurus',
+        familyStatus: 'umum',
+        familyStatusLog: [`${getCurrentYearMonth()}:umum`],
+        elderlyMode: false,
+        communityId: 'rt_warga',
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      };
+
+      setIsBootstrappedAdminUser(isBootstrappedEmail || isEmptyDatabase || !activeSheet?.spreadsheetId);
+      setAdminRecord(finalAdmin);
+      setProfile(userProf);
+      if (typeof userProf.elderlyMode === 'boolean') {
+        setElderlyMode(userProf.elderlyMode);
+      }
+      setCurrentUser({
+        uid: userProf.uid,
+        email: activeEmail || '',
+        displayName: userProf.displayName,
+        username: userProf.username,
+        role: 'pengurus',
+      });
+      setActiveTab('beranda');
+      if (!localStorage.getItem(`kaswarga_seen_intro_${userProf.uid}`)) {
+        setShowNewUserBanner(true);
+      }
+      initialNotificationIdsRef.current = null;
     } catch (err) {
-      expectedLoginRoleRef.current = null;
-      const code = (err as { code?: string })?.code || '';
-      const rawMessage = err instanceof Error ? err.message : '';
-      if (code === 'auth/unauthorized-domain' || rawMessage.includes('auth/unauthorized-domain')) {
-        const host = typeof window !== 'undefined' ? window.location.hostname : '';
-        setLoginError(
-          `Domain "${host}" belum terdaftar di Authorized Domains Firebase Authentication. Jika membuka dari URL baru/eksternal, tambahkan "${host}" di Firebase Console (Authentication → Settings → Authorized domains), atau muat ulang halaman jika baru saja diperbarui.`
-        );
-      } else if (code === 'auth/popup-blocked') {
-        setLoginError(
-          'Pop-up login Google diblokir oleh browser. Mohon izinkan pop-up untuk situs ini lalu coba lagi.'
-        );
-      } else if (code === 'auth/popup-closed-by-user') {
-        setLoginError(
-          'Jendela login Google ditutup sebelum proses masuk selesai. Silakan klik Masuk kembali.'
-        );
+      if (err instanceof SheetsAuthExpiredError) {
+        handleExpiredToken();
       } else {
-        setLoginError(
-          err instanceof Error
-            ? `Gagal masuk: ${err.message}`
-            : 'Gagal masuk dengan Google. Pastikan pop-up diizinkan.'
-        );
+        const code = (err as { code?: string })?.code || '';
+        if (code === 'auth/popup-blocked') {
+          setLoginError(
+            'Pop-up login Google diblokir oleh browser. Mohon izinkan pop-up lalu coba lagi.'
+          );
+        } else if (code === 'auth/popup-closed-by-user') {
+          setLoginError('Jendela login Google ditutup sebelum selesai. Silakan coba lagi.');
+        } else {
+          setLoginError(
+            err instanceof Error ? `Gagal masuk Admin Google: ${err.message}` : 'Gagal masuk.'
+          );
+        }
       }
     } finally {
       setIsLoggingIn(false);
@@ -864,21 +1369,40 @@ export default function App() {
   const handleLogout = async () => {
     setSettingsOpen(false);
     setRegistryOpen(false);
-    expectedLoginRoleRef.current = null;
-    await signOut(auth);
+    setCurrentUser(null);
+    setProfile(null);
+    setAdminRecord(null);
+    setIsBootstrappedAdminUser(false);
+    initialNotificationIdsRef.current = null;
   };
 
   const handleToggleElderlyMode = async () => {
     const next = !elderlyMode;
     setElderlyMode(next);
-    if (currentUser && profile) {
+    const token = getGoogleAccessToken();
+    if (currentUser && profile && token && sheetInfo?.spreadsheetId) {
+      const confirmed = await requestSheetConfirmation({
+        title: 'Simpan Preferensi Mode Ramah Lansia',
+        description: `Perbarui preferensi Teks Besar (${next ? 'Aktif' : 'Nonaktif'}) untuk "${
+          profile.displayName
+        }" di Google Spreadsheet?`,
+        details: [`Tab: ${SHEET_TABS.USERS}`],
+        confirmLabel: 'Simpan Perubahan',
+      });
+      if (!confirmed) return;
+
       try {
-        await updateDoc(doc(db, 'users', currentUser.uid), {
+        const updated: ResidentPublic = {
+          ...profile,
           elderlyMode: next,
-          updatedAt: serverTimestamp(),
-        });
-      } catch {
-        // Still persisted locally
+          updatedAt: new Date().toISOString(),
+        };
+        await upsertSheetRowsByKey(token, sheetInfo.spreadsheetId, SHEET_TABS.USERS, [
+          userProfileToRow(updated),
+        ]);
+        setProfile(updated);
+      } catch (err) {
+        if (err instanceof SheetsAuthExpiredError) handleExpiredToken();
       }
     }
   };
@@ -918,14 +1442,40 @@ export default function App() {
       return;
     }
 
+    const token = getGoogleAccessToken();
+    if (!token || !sheetInfo?.spreadsheetId) {
+      requireActiveSheet();
+      return;
+    }
+
+    const confirmed = await requestSheetConfirmation({
+      title: 'Simpan Pembayaran Iuran ke Google Spreadsheet',
+      description: `Tambahkan catatan pembayaran iuran "${payload.title}" sebesar ${formatRupiah(
+        payload.amount
+      )} ke Google Spreadsheet "${sheetInfo.spreadsheetTitle}"?`,
+      details: [`Tab: ${SHEET_TABS.TRANSACTIONS}`, `Bulan Tagihan: ${payload.billingMonth}`],
+      confirmLabel: 'Kirim & Simpan',
+    });
+    if (!confirmed) return;
+
+    isMutatingRef.current = true;
     try {
-      await addDoc(collection(db, 'transactions'), {
+      const nowIso = new Date().toISOString();
+      const newTx: KasTransaction = {
+        id: generateRecordId('tx'),
         ...payload,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      };
+      await appendSheetRows(token, sheetInfo.spreadsheetId, SHEET_TABS.TRANSACTIONS, [
+        transactionToRow(newTx),
+      ]);
+      await refreshSpreadsheetData(token, sheetInfo.spreadsheetId, true);
     } catch (err) {
-      handleFirestoreError(err, OperationType.CREATE, 'transactions');
+      if (err instanceof SheetsAuthExpiredError) handleExpiredToken();
+      else throw err;
+    } finally {
+      isMutatingRef.current = false;
     }
   };
 
@@ -939,8 +1489,29 @@ export default function App() {
     notes: string;
   }) => {
     if (!currentUser || !profile) return;
+    const token = getGoogleAccessToken();
+    if (!token || !sheetInfo?.spreadsheetId) {
+      requireActiveSheet();
+      return;
+    }
+
+    const confirmed = await requestSheetConfirmation({
+      title: 'Catat Transaksi Kas ke Google Spreadsheet',
+      description: `Simpan transaksi ${
+        data.type === 'income' ? 'Pemasukan' : 'Pengeluaran'
+      } "${data.title}" (${formatRupiah(data.amount)}) ke Google Spreadsheet "${
+        sheetInfo.spreadsheetTitle
+      }"?`,
+      details: [`Tab: ${SHEET_TABS.TRANSACTIONS}`],
+      confirmLabel: 'Simpan Transaksi',
+    });
+    if (!confirmed) return;
+
+    isMutatingRef.current = true;
     try {
-      await addDoc(collection(db, 'transactions'), {
+      const nowIso = new Date().toISOString();
+      const newTx: KasTransaction = {
+        id: generateRecordId('tx'),
         type: data.type,
         category: data.category,
         title: data.title.slice(0, 120),
@@ -956,11 +1527,18 @@ export default function App() {
         rejectionReason: '',
         notes: data.notes.slice(0, 300),
         communityId: 'rt_warga',
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      };
+      await appendSheetRows(token, sheetInfo.spreadsheetId, SHEET_TABS.TRANSACTIONS, [
+        transactionToRow(newTx),
+      ]);
+      await refreshSpreadsheetData(token, sheetInfo.spreadsheetId, true);
     } catch (err) {
-      handleFirestoreError(err, OperationType.CREATE, 'transactions');
+      if (err instanceof SheetsAuthExpiredError) handleExpiredToken();
+      else throw err;
+    } finally {
+      isMutatingRef.current = false;
     }
   };
 
@@ -970,6 +1548,12 @@ export default function App() {
     rejectionReason?: string
   ) => {
     if (!currentUser) return;
+    const token = getGoogleAccessToken();
+    if (!token || !sheetInfo?.spreadsheetId) {
+      requireActiveSheet();
+      return;
+    }
+
     const resident = residents.find((r) => r.uid === tx.residentUid);
     const familyStatus = tx.familyStatus || resident?.familyStatus || 'umum';
     const effectiveResident: ResidentPublic = resident || {
@@ -998,16 +1582,37 @@ export default function App() {
     const finalStatus =
       decision === 'rejected' ? 'rejected' : isUnderpaid ? 'kurang_bayar' : 'approved';
 
-    try {
-      const batch = writeBatch(db);
-      batch.update(doc(db, 'transactions', tx.id), {
-        status: finalStatus,
-        rejectionReason: decision === 'rejected' ? (rejectionReason || '').slice(0, 200) : '',
-        verifiedBy: currentUser.uid,
-        updatedAt: serverTimestamp(),
-      });
+    const confirmed = await requestSheetConfirmation({
+      title:
+        decision === 'rejected'
+          ? 'Konfirmasi Penolakan Pembayaran di Spreadsheet'
+          : 'Konfirmasi Verifikasi Pembayaran di Spreadsheet',
+      description: `Perbarui status transaksi "${tx.title}" milik ${tx.residentName} (${tx.houseBlock}) menjadi "${finalStatus === 'approved' ? 'DISETUJUI' : finalStatus === 'rejected' ? 'DITOLAK' : 'KURANG BAYAR'}" pada Google Spreadsheet?`,
+      details: [
+        `Nominal: ${formatRupiah(tx.amount)}`,
+        `Tab diperbarui: ${SHEET_TABS.TRANSACTIONS}, ${SHEET_TABS.NOTIFICATIONS}${
+          decision === 'approved' && !isUnderpaid ? `, ${SHEET_TABS.USERS}` : ''
+        }`,
+      ],
+      confirmLabel: decision === 'rejected' ? 'Ya, Tolak Pembayaran' : 'Setujui & Simpan',
+      destructive: decision === 'rejected',
+    });
+    if (!confirmed) return;
 
-      // Jika pembayaran ini melunasi bulan tagihan, ubah transaksi kurang_bayar sebelumnya menjadi approved (Lunas)
+    isMutatingRef.current = true;
+    try {
+      const nowIso = new Date().toISOString();
+      const txUpdates: KasTransaction[] = [
+        {
+          ...tx,
+          status: finalStatus,
+          rejectionReason:
+            decision === 'rejected' ? (rejectionReason || '').slice(0, 200) : '',
+          verifiedBy: currentUser.uid,
+          updatedAt: nowIso,
+        },
+      ];
+
       if (decision === 'approved' && tx.category === 'iuran_bulanan' && !isUnderpaid) {
         const priorUnderpaid = transactions.filter(
           (t) =>
@@ -1019,30 +1624,36 @@ export default function App() {
             t.status === 'kurang_bayar'
         );
         for (const prevTx of priorUnderpaid) {
-          batch.update(doc(db, 'transactions', prevTx.id), {
+          txUpdates.push({
+            ...prevTx,
             status: 'approved',
             verifiedBy: currentUser.uid,
-            updatedAt: serverTimestamp(),
+            updatedAt: nowIso,
           });
         }
       }
 
-      await batch.commit();
+      await upsertSheetRowsByKey(
+        token,
+        sheetInfo.spreadsheetId,
+        SHEET_TABS.TRANSACTIONS,
+        txUpdates.map(transactionToRow)
+      );
 
-      if (decision === 'approved' && tx.category === 'iuran_bulanan' && !isUnderpaid) {
-        try {
-          await updateDoc(doc(db, 'users', tx.residentUid), {
+      if (decision === 'approved' && tx.category === 'iuran_bulanan' && !isUnderpaid && resident) {
+        await upsertSheetRowsByKey(token, sheetInfo.spreadsheetId, SHEET_TABS.USERS, [
+          userProfileToRow({
+            ...resident,
             lastPaidMonth: tx.billingMonth,
-            updatedAt: serverTimestamp(),
-          });
-        } catch {
-          // Ignore if resident doc missing
-        }
+            updatedAt: nowIso,
+          }),
+        ]);
       }
 
       const shortfall = ledgerAfter.shortfall;
       const surplus = ledgerAfter.surplus;
-      await addDoc(collection(db, 'notifications'), {
+      const notif: UserNotification = {
+        id: generateRecordId('ntf'),
         targetUid: tx.residentUid,
         senderUid: currentUser.uid,
         title:
@@ -1061,15 +1672,27 @@ export default function App() {
             : surplus > 0
             ? `Pembayaran ${formatRupiah(tx.amount)} disetujui. Iuran ${formatMonthLabel(
                 tx.billingMonth
-              )} LUNAS dan kelebihan ${formatRupiah(surplus)} otomatis menjadi saldo bulan berikutnya.`
-            : `Pembayaran ${formatRupiah(tx.amount)} telah diverifikasi oleh bendahara RT. Status iuran kini LUNAS.`,
+              )} LUNAS dan kelebihan ${formatRupiah(
+                surplus
+              )} otomatis menjadi saldo bulan berikutnya.`
+            : `Pembayaran ${formatRupiah(
+                tx.amount
+              )} telah diverifikasi oleh bendahara RT. Status iuran kini LUNAS.`,
         type: decision === 'approved' ? 'payment_approved' : 'payment_rejected',
         isRead: false,
         relatedId: tx.id,
-        createdAt: serverTimestamp(),
-      });
+        createdAt: nowIso,
+      };
+      await appendSheetRows(token, sheetInfo.spreadsheetId, SHEET_TABS.NOTIFICATIONS, [
+        notificationToRow(notif),
+      ]);
+
+      await refreshSpreadsheetData(token, sheetInfo.spreadsheetId, true);
     } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, `transactions/${tx.id}`);
+      if (err instanceof SheetsAuthExpiredError) handleExpiredToken();
+      else throw err;
+    } finally {
+      isMutatingRef.current = false;
     }
   };
 
@@ -1077,15 +1700,35 @@ export default function App() {
     unpaidResidents: ResidentPublic[],
     yearMonth: string
   ): Promise<number> => {
-    if (!currentUser) return 0;
+    if (!currentUser || unpaidResidents.length === 0) return 0;
+    const token = getGoogleAccessToken();
+    if (!token || !sheetInfo?.spreadsheetId) {
+      requireActiveSheet();
+      return 0;
+    }
+
+    const confirmed = await requestSheetConfirmation({
+      title: 'Kirim Pengingat Iuran Massal',
+      description: `Tambahkan ${unpaidResidents.length} notifikasi pengingat iuran bulan ${formatMonthLabel(
+        yearMonth
+      )} ke Google Spreadsheet?`,
+      details: [
+        `Tab: ${SHEET_TABS.NOTIFICATIONS}`,
+        `Jumlah penerima: ${unpaidResidents.length} warga`,
+      ],
+      confirmLabel: `Kirim (${unpaidResidents.length} Warga)`,
+    });
+    if (!confirmed) return 0;
+
+    isMutatingRef.current = true;
     try {
-      const batch = writeBatch(db);
-      for (const res of unpaidResidents) {
+      const nowIso = new Date().toISOString();
+      const rows = unpaidResidents.map((res) => {
         const resTariff = getRequiredTariff(
           getResidentFamilyStatusForMonth(res, yearMonth, transactions)
         );
-        const ref = doc(collection(db, 'notifications'));
-        batch.set(ref, {
+        return notificationToRow({
+          id: generateRecordId('ntf'),
           targetUid: res.uid,
           senderUid: currentUser.uid,
           title: `Pengingat Iuran ${formatMonthLabel(yearMonth)}`,
@@ -1095,13 +1738,19 @@ export default function App() {
           type: 'payment_reminder',
           isRead: false,
           relatedId: yearMonth,
-          createdAt: serverTimestamp(),
+          createdAt: nowIso,
         });
-      }
-      await batch.commit();
+      });
+
+      await appendSheetRows(token, sheetInfo.spreadsheetId, SHEET_TABS.NOTIFICATIONS, rows);
+      await refreshSpreadsheetData(token, sheetInfo.spreadsheetId, true);
       return unpaidResidents.length;
     } catch (err) {
-      handleFirestoreError(err, OperationType.WRITE, 'notifications');
+      if (err instanceof SheetsAuthExpiredError) handleExpiredToken();
+      else throw err;
+      return 0;
+    } finally {
+      isMutatingRef.current = false;
     }
   };
 
@@ -1112,8 +1761,27 @@ export default function App() {
     priority: 'normal' | 'urgent';
   }) => {
     if (!currentUser || !profile) return;
+    const token = getGoogleAccessToken();
+    if (!token || !sheetInfo?.spreadsheetId) {
+      requireActiveSheet();
+      return;
+    }
+
+    const confirmed = await requestSheetConfirmation({
+      title: 'Terbitkan Pengumuman ke Google Spreadsheet',
+      description: `Simpan pengumuman "${data.title}" (${data.priority.toUpperCase()}) ke Google Spreadsheet "${
+        sheetInfo.spreadsheetTitle
+      }"?`,
+      details: [`Tab: ${SHEET_TABS.ANNOUNCEMENTS}`],
+      confirmLabel: 'Terbitkan Pengumuman',
+    });
+    if (!confirmed) return;
+
+    isMutatingRef.current = true;
     try {
-      await addDoc(collection(db, 'announcements'), {
+      const nowIso = new Date().toISOString();
+      const ann: Announcement = {
+        id: generateRecordId('ann'),
         title: data.title.slice(0, 120),
         body: data.body.slice(0, 1000),
         category: data.category,
@@ -1121,19 +1789,49 @@ export default function App() {
         authorUid: currentUser.uid,
         authorName: profile.displayName.slice(0, 80),
         communityId: 'rt_warga',
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      };
+      await appendSheetRows(token, sheetInfo.spreadsheetId, SHEET_TABS.ANNOUNCEMENTS, [
+        announcementToRow(ann),
+      ]);
+      await refreshSpreadsheetData(token, sheetInfo.spreadsheetId, true);
     } catch (err) {
-      handleFirestoreError(err, OperationType.CREATE, 'announcements');
+      if (err instanceof SheetsAuthExpiredError) handleExpiredToken();
+      else throw err;
+    } finally {
+      isMutatingRef.current = false;
     }
   };
 
   const handleDeleteAnnouncement = async (id: string) => {
+    const token = getGoogleAccessToken();
+    if (!token || !sheetInfo?.spreadsheetId) {
+      requireActiveSheet();
+      return;
+    }
+    const target = announcements.find((a) => a.id === id);
+
+    const confirmed = await requestSheetConfirmation({
+      title: 'Hapus Pengumuman dari Google Spreadsheet',
+      description: `Anda yakin ingin menghapus pengumuman "${
+        target?.title || id
+      }" secara permanen dari Google Spreadsheet?`,
+      details: [`Tab: ${SHEET_TABS.ANNOUNCEMENTS}`],
+      confirmLabel: 'Ya, Hapus Pengumuman',
+      destructive: true,
+    });
+    if (!confirmed) return;
+
+    isMutatingRef.current = true;
     try {
-      await deleteDoc(doc(db, 'announcements', id));
+      await deleteSheetRowsByKey(token, sheetInfo.spreadsheetId, SHEET_TABS.ANNOUNCEMENTS, [id]);
+      await refreshSpreadsheetData(token, sheetInfo.spreadsheetId, true);
     } catch (err) {
-      handleFirestoreError(err, OperationType.DELETE, `announcements/${id}`);
+      if (err instanceof SheetsAuthExpiredError) handleExpiredToken();
+      else throw err;
+    } finally {
+      isMutatingRef.current = false;
     }
   };
 
@@ -1181,14 +1879,41 @@ export default function App() {
       return;
     }
 
+    const token = getGoogleAccessToken();
+    if (!token || !sheetInfo?.spreadsheetId) {
+      requireActiveSheet();
+      return;
+    }
+
+    const confirmed = await requestSheetConfirmation({
+      title: 'Kirim Sinyal Darurat SOS ke Google Spreadsheet',
+      description: `Catat dan siarkan laporan darurat (${payload.emergencyType.toUpperCase()}) dari ${
+        profile.houseBlock
+      } ke Google Spreadsheet "${sheetInfo.spreadsheetTitle}"?`,
+      details: [`Tab: ${SHEET_TABS.EMERGENCIES}`],
+      confirmLabel: 'Kirim Sinyal SOS',
+      destructive: true,
+    });
+    if (!confirmed) return;
+
+    isMutatingRef.current = true;
     try {
-      await addDoc(collection(db, 'emergencies'), {
+      const nowIso = new Date().toISOString();
+      const em: EmergencyAlert = {
+        id: generateRecordId('em'),
         ...docPayload,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      };
+      await appendSheetRows(token, sheetInfo.spreadsheetId, SHEET_TABS.EMERGENCIES, [
+        emergencyToRow(em),
+      ]);
+      await refreshSpreadsheetData(token, sheetInfo.spreadsheetId, true);
     } catch (err) {
-      handleFirestoreError(err, OperationType.CREATE, 'emergencies');
+      if (err instanceof SheetsAuthExpiredError) handleExpiredToken();
+      else throw err;
+    } finally {
+      isMutatingRef.current = false;
     }
   };
 
@@ -1197,17 +1922,42 @@ export default function App() {
     status: 'responding' | 'resolved'
   ) => {
     if (!currentUser || !profile) return;
+    const token = getGoogleAccessToken();
+    if (!token || !sheetInfo?.spreadsheetId) {
+      requireActiveSheet();
+      return;
+    }
+
+    const confirmed = await requestSheetConfirmation({
+      title: 'Perbarui Status Darurat SOS di Spreadsheet',
+      description: `Ubah status laporan darurat ${alert.reporterName} (${alert.houseBlock}) menjadi "${
+        status === 'responding' ? 'Sedang Ditangani' : 'Selesai'
+      }" di Google Spreadsheet?`,
+      details: [`Tab: ${SHEET_TABS.EMERGENCIES}`],
+      confirmLabel: 'Perbarui Status',
+    });
+    if (!confirmed) return;
+
+    isMutatingRef.current = true;
     try {
-      const updates: Record<string, unknown> = {
+      const updated: EmergencyAlert = {
+        ...alert,
         status,
-        updatedAt: serverTimestamp(),
+        responderName:
+          rbac.canManageEmergencies && status === 'responding'
+            ? profile.displayName.slice(0, 80)
+            : alert.responderName || '',
+        updatedAt: new Date().toISOString(),
       };
-      if (rbac.canManageEmergencies && status === 'responding') {
-        updates.responderName = profile.displayName.slice(0, 80);
-      }
-      await updateDoc(doc(db, 'emergencies', alert.id), updates);
+      await upsertSheetRowsByKey(token, sheetInfo.spreadsheetId, SHEET_TABS.EMERGENCIES, [
+        emergencyToRow(updated),
+      ]);
+      await refreshSpreadsheetData(token, sheetInfo.spreadsheetId, true);
     } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, `emergencies/${alert.id}`);
+      if (err instanceof SheetsAuthExpiredError) handleExpiredToken();
+      else throw err;
+    } finally {
+      isMutatingRef.current = false;
     }
   };
 
@@ -1216,6 +1966,20 @@ export default function App() {
     nextHealth: PrivateHealthData
   ) => {
     if (!currentUser) return;
+    const token = getGoogleAccessToken();
+    if (!token || !sheetInfo?.spreadsheetId) {
+      requireActiveSheet();
+      return;
+    }
+
+    const confirmed = await requestSheetConfirmation({
+      title: 'Simpan Data Pribadi & Kesehatan Terenkripsi',
+      description: `Enkripsi (AES-256-GCM) dan perbarui data kontak darurat serta kartu medis Anda di Google Spreadsheet "${sheetInfo.spreadsheetTitle}"?`,
+      details: [`Tab: ${SHEET_TABS.PRIVATE_DATA}`],
+      confirmLabel: 'Enkripsi & Simpan',
+    });
+    if (!confirmed) return;
+
     setPrivateProfile(nextProfile);
     setHealthProfile(nextHealth);
 
@@ -1233,26 +1997,35 @@ export default function App() {
       .join(' · ')
       .slice(0, 400);
 
+    isMutatingRef.current = true;
     try {
-      await setDoc(doc(db, 'users', currentUser.uid, 'private', 'profile'), {
-        uid: currentUser.uid,
-        docType: 'profile',
-        encryptedPayload: encProfile,
-        encryptionAlg: 'AES-GCM-256',
-        updatedAt: serverTimestamp(),
-      });
-
-      await setDoc(doc(db, 'users', currentUser.uid, 'private', 'health'), {
-        uid: currentUser.uid,
-        docType: 'health',
-        encryptedPayload: encHealth,
-        encryptionAlg: 'AES-GCM-256',
-        shareInEmergency: nextHealth.shareInEmergency,
-        emergencySummary: summary,
-        updatedAt: serverTimestamp(),
-      });
+      const nowIso = new Date().toISOString();
+      await upsertSheetRowsByKey(token, sheetInfo.spreadsheetId, SHEET_TABS.PRIVATE_DATA, [
+        privateDataToRow({
+          id: `${currentUser.uid}_profile`,
+          uid: currentUser.uid,
+          docType: 'profile',
+          encryptedPayload: encProfile,
+          encryptionAlg: 'AES-GCM-256',
+          updatedAt: nowIso,
+        }),
+        privateDataToRow({
+          id: `${currentUser.uid}_health`,
+          uid: currentUser.uid,
+          docType: 'health',
+          encryptedPayload: encHealth,
+          encryptionAlg: 'AES-GCM-256',
+          shareInEmergency: nextHealth.shareInEmergency,
+          emergencySummary: summary,
+          updatedAt: nowIso,
+        }),
+      ]);
+      await refreshSpreadsheetData(token, sheetInfo.spreadsheetId, true);
     } catch (err) {
-      handleFirestoreError(err, OperationType.WRITE, `users/${currentUser.uid}/private`);
+      if (err instanceof SheetsAuthExpiredError) handleExpiredToken();
+      else throw err;
+    } finally {
+      isMutatingRef.current = false;
     }
   };
 
@@ -1262,12 +2035,26 @@ export default function App() {
     residentStatus: ResidentStatus;
     familyStatus: FamilyStatus;
   }) => {
-    if (!currentUser) return;
-    const prevFamilyStatus: FamilyStatus = profile?.familyStatus || 'umum';
-    const hasFamilyStatusChanged = data.familyStatus !== prevFamilyStatus;
-    let nextFamilyStatusLog: string[] | undefined;
+    if (!currentUser || !profile) return;
+    const token = getGoogleAccessToken();
+    if (!token || !sheetInfo?.spreadsheetId) {
+      requireActiveSheet();
+      return;
+    }
 
-    if (hasFamilyStatusChanged && profile) {
+    const confirmed = await requestSheetConfirmation({
+      title: 'Perbarui Identitas Rumah Warga di Spreadsheet',
+      description: `Simpan perubahan identitas atas nama "${data.displayName}" (${data.houseBlock}) ke Google Spreadsheet "${sheetInfo.spreadsheetTitle}"?`,
+      details: [`Tab: ${SHEET_TABS.USERS}`],
+      confirmLabel: 'Simpan Identitas',
+    });
+    if (!confirmed) return;
+
+    const prevFamilyStatus: FamilyStatus = profile.familyStatus || 'umum';
+    const hasFamilyStatusChanged = data.familyStatus !== prevFamilyStatus;
+    let nextFamilyStatusLog = profile.familyStatusLog;
+
+    if (hasFamilyStatusChanged) {
       const effectiveMonth = getEffectiveFamilyStatusChangeMonth(
         transactions,
         currentUser.uid
@@ -1279,44 +2066,67 @@ export default function App() {
       );
     }
 
-    const updates: Record<string, unknown> = {
+    const updatedProfile: ResidentPublic = {
+      ...profile,
       displayName: data.displayName.slice(0, 80),
       houseBlock: data.houseBlock.slice(0, 30),
       residentStatus: data.residentStatus,
       familyStatus: data.familyStatus,
-      updatedAt: serverTimestamp(),
+      familyStatusLog: nextFamilyStatusLog,
+      updatedAt: new Date().toISOString(),
     };
-    if (nextFamilyStatusLog) {
-      updates.familyStatusLog = nextFamilyStatusLog;
-    }
 
+    isMutatingRef.current = true;
     try {
-      await updateDoc(doc(db, 'users', currentUser.uid), updates);
-      setProfile((prev) =>
-        prev
-          ? {
-              ...prev,
-              ...data,
-              ...(nextFamilyStatusLog ? { familyStatusLog: nextFamilyStatusLog } : {}),
-            }
-          : prev
-      );
+      await upsertSheetRowsByKey(token, sheetInfo.spreadsheetId, SHEET_TABS.USERS, [
+        userProfileToRow(updatedProfile),
+      ]);
+      setProfile(updatedProfile);
+      await refreshSpreadsheetData(token, sheetInfo.spreadsheetId, true);
     } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, `users/${currentUser.uid}`);
+      if (err instanceof SheetsAuthExpiredError) handleExpiredToken();
+      else throw err;
+    } finally {
+      isMutatingRef.current = false;
     }
   };
 
   const handleSaveRtSettings = async (data: Omit<RtSettings, 'updatedBy' | 'updatedAt'>) => {
     if (!currentUser) return;
+    const token = getGoogleAccessToken();
+    if (!token || !sheetInfo?.spreadsheetId) {
+      requireActiveSheet();
+      return;
+    }
+
+    const confirmed = await requestSheetConfirmation({
+      title: 'Perbarui Pengaturan Kas RT di Google Spreadsheet',
+      description: `Timpa pengaturan RT (${data.rtName} / ${data.rwName}, iuran ${formatRupiah(
+        data.monthlyDuesAmount
+      )}) pada Google Spreadsheet "${sheetInfo.spreadsheetTitle}"?`,
+      details: [`Tab: ${SHEET_TABS.SETTINGS}`],
+      confirmLabel: 'Simpan Pengaturan',
+    });
+    if (!confirmed) return;
+
+    isMutatingRef.current = true;
     try {
-      await setDoc(doc(db, 'settings', 'rt_config'), {
+      const nowIso = new Date().toISOString();
+      const nextSettings: RtSettings = {
         ...data,
         updatedBy: currentUser.uid,
-        updatedAt: serverTimestamp(),
-      });
-      setRtSettings({ ...data, updatedBy: currentUser.uid });
+        updatedAt: nowIso,
+      };
+      await upsertSheetRowsByKey(token, sheetInfo.spreadsheetId, SHEET_TABS.SETTINGS, [
+        settingsToRow(nextSettings, nowIso),
+      ]);
+      setRtSettings(nextSettings);
+      await refreshSpreadsheetData(token, sheetInfo.spreadsheetId, true);
     } catch (err) {
-      handleFirestoreError(err, OperationType.WRITE, 'settings/rt_config');
+      if (err instanceof SheetsAuthExpiredError) handleExpiredToken();
+      else throw err;
+    } finally {
+      isMutatingRef.current = false;
     }
   };
 
@@ -1326,6 +2136,22 @@ export default function App() {
     imageData: string;
   }) => {
     if (!currentUser) return;
+    const token = getGoogleAccessToken();
+    if (!token || !sheetInfo?.spreadsheetId) {
+      requireActiveSheet();
+      return;
+    }
+
+    const confirmed = await requestSheetConfirmation({
+      title: 'Tambahkan Foto Slideshow ke Google Spreadsheet',
+      description: `Simpan foto kegiatan "${
+        data.title || 'Kegiatan Warga'
+      }" ke tab slideshow Google Spreadsheet "${sheetInfo.spreadsheetTitle}"?`,
+      details: [`Tab: ${SHEET_TABS.SLIDES}`],
+      confirmLabel: 'Tambahkan Foto',
+    });
+    if (!confirmed) return;
+
     const nextSortOrder =
       bannerSlides.length > 0
         ? Math.min(
@@ -1333,19 +2159,30 @@ export default function App() {
             Math.max(...bannerSlides.map((s) => Math.round(Number(s.sortOrder) || 0))) + 1
           )
         : 0;
+
+    isMutatingRef.current = true;
     try {
-      await addDoc(collection(db, 'slides'), {
+      const nowIso = new Date().toISOString();
+      const slide: BannerSlide = {
+        id: generateRecordId('sld'),
         title: data.title.trim().slice(0, 80),
         subtitle: data.subtitle.trim().slice(0, 160),
         imageData: data.imageData,
         sortOrder: nextSortOrder,
         uploadedBy: currentUser.uid,
         communityId: 'rt_warga',
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      };
+      await appendSheetRows(token, sheetInfo.spreadsheetId, SHEET_TABS.SLIDES, [
+        slideToRow(slide),
+      ]);
+      await refreshSpreadsheetData(token, sheetInfo.spreadsheetId, true);
     } catch (err) {
-      handleFirestoreError(err, OperationType.CREATE, 'slides');
+      if (err instanceof SheetsAuthExpiredError) handleExpiredToken();
+      else throw err;
+    } finally {
+      isMutatingRef.current = false;
     }
   };
 
@@ -1353,18 +2190,48 @@ export default function App() {
     id: string,
     data: { title: string; subtitle: string }
   ) => {
+    const token = getGoogleAccessToken();
+    if (!token || !sheetInfo?.spreadsheetId) {
+      requireActiveSheet();
+      return;
+    }
+    const existing = bannerSlides.find((s) => s.id === id);
+    if (!existing) return;
+
+    const confirmed = await requestSheetConfirmation({
+      title: 'Perbarui Keterangan Foto Slideshow',
+      description: `Ubah judul dan keterangan foto "${existing.title}" menjadi "${data.title}" di Google Spreadsheet?`,
+      details: [`Tab: ${SHEET_TABS.SLIDES}`],
+      confirmLabel: 'Simpan Perubahan',
+    });
+    if (!confirmed) return;
+
+    isMutatingRef.current = true;
     try {
-      await updateDoc(doc(db, 'slides', id), {
+      const updated: BannerSlide = {
+        ...existing,
         title: data.title.trim().slice(0, 80),
         subtitle: data.subtitle.trim().slice(0, 160),
-        updatedAt: serverTimestamp(),
-      });
+        updatedAt: new Date().toISOString(),
+      };
+      await upsertSheetRowsByKey(token, sheetInfo.spreadsheetId, SHEET_TABS.SLIDES, [
+        slideToRow(updated),
+      ]);
+      await refreshSpreadsheetData(token, sheetInfo.spreadsheetId, true);
     } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, `slides/${id}`);
+      if (err instanceof SheetsAuthExpiredError) handleExpiredToken();
+      else throw err;
+    } finally {
+      isMutatingRef.current = false;
     }
   };
 
   const handleMoveBannerSlide = async (id: string, direction: 'up' | 'down') => {
+    const token = getGoogleAccessToken();
+    if (!token || !sheetInfo?.spreadsheetId) {
+      requireActiveSheet();
+      return;
+    }
     const idx = bannerSlides.findIndex((s) => s.id === id);
     if (idx === -1) return;
     const targetIdx = direction === 'up' ? idx - 1 : idx + 1;
@@ -1374,25 +2241,64 @@ export default function App() {
     const [moved] = reordered.splice(idx, 1);
     reordered.splice(targetIdx, 0, moved);
 
+    const confirmed = await requestSheetConfirmation({
+      title: 'Ubah Urutan Slideshow di Google Spreadsheet',
+      description: `Geser posisi foto "${moved.title}" ${
+        direction === 'up' ? 'ke atas' : 'ke bawah'
+      } pada Google Spreadsheet?`,
+      details: [`Tab: ${SHEET_TABS.SLIDES}`, `${reordered.length} baris diperbarui`],
+      confirmLabel: 'Simpan Urutan',
+    });
+    if (!confirmed) return;
+
+    isMutatingRef.current = true;
     try {
-      const batch = writeBatch(db);
-      reordered.forEach((slide, orderIdx) => {
-        batch.update(doc(db, 'slides', slide.id), {
+      const nowIso = new Date().toISOString();
+      const updatedRows = reordered.map((slide, orderIdx) =>
+        slideToRow({
+          ...slide,
           sortOrder: orderIdx,
-          updatedAt: serverTimestamp(),
-        });
-      });
-      await batch.commit();
+          updatedAt: nowIso,
+        })
+      );
+      await upsertSheetRowsByKey(token, sheetInfo.spreadsheetId, SHEET_TABS.SLIDES, updatedRows);
+      await refreshSpreadsheetData(token, sheetInfo.spreadsheetId, true);
     } catch (err) {
-      handleFirestoreError(err, OperationType.WRITE, 'slides');
+      if (err instanceof SheetsAuthExpiredError) handleExpiredToken();
+      else throw err;
+    } finally {
+      isMutatingRef.current = false;
     }
   };
 
   const handleDeleteBannerSlide = async (id: string) => {
+    const token = getGoogleAccessToken();
+    if (!token || !sheetInfo?.spreadsheetId) {
+      requireActiveSheet();
+      return;
+    }
+    const target = bannerSlides.find((s) => s.id === id);
+
+    const confirmed = await requestSheetConfirmation({
+      title: 'Hapus Foto Slideshow dari Google Spreadsheet',
+      description: `Anda yakin ingin menghapus foto "${
+        target?.title || id
+      }" secara permanen dari Google Spreadsheet?`,
+      details: [`Tab: ${SHEET_TABS.SLIDES}`],
+      confirmLabel: 'Ya, Hapus Foto',
+      destructive: true,
+    });
+    if (!confirmed) return;
+
+    isMutatingRef.current = true;
     try {
-      await deleteDoc(doc(db, 'slides', id));
+      await deleteSheetRowsByKey(token, sheetInfo.spreadsheetId, SHEET_TABS.SLIDES, [id]);
+      await refreshSpreadsheetData(token, sheetInfo.spreadsheetId, true);
     } catch (err) {
-      handleFirestoreError(err, OperationType.DELETE, `slides/${id}`);
+      if (err instanceof SheetsAuthExpiredError) handleExpiredToken();
+      else throw err;
+    } finally {
+      isMutatingRef.current = false;
     }
   };
 
@@ -1406,9 +2312,14 @@ export default function App() {
     familyStatus: FamilyStatus;
   }) => {
     if (!currentUser) return;
+    const token = getGoogleAccessToken();
+    if (!token || !sheetInfo?.spreadsheetId) {
+      requireActiveSheet();
+      return;
+    }
+
     const registryId = await computeResidentRegistryId(data.fullName, data.houseBlock);
-    const ref = doc(db, 'resident_registry', registryId);
-    const existingSnap = await getDoc(ref);
+    const existing = registryEntries.find((e) => e.registryId === registryId);
     const isPengurusEntry = data.role === 'pengurus' && rbac.isFullAdmin;
     const effectiveRole: LoginRole = isPengurusEntry ? 'pengurus' : 'warga';
     const pengurusPosition: PengurusPosition | undefined = isPengurusEntry
@@ -1419,45 +2330,63 @@ export default function App() {
         ? normalizePengurusPermissions(pengurusPosition, data.permissions)
         : undefined;
 
+    const confirmed = await requestSheetConfirmation({
+      title: existing
+        ? 'Perbarui Data Warga di Google Spreadsheet'
+        : 'Tambah Data Warga ke Google Spreadsheet',
+      description: `${existing ? 'Perbarui' : 'Tambahkan'} data "${data.fullName.trim()}" (${data.houseBlock.trim()}) sebagai ${
+        effectiveRole === 'pengurus' ? 'Pengurus' : 'Warga'
+      } pada Database Warga di Google Spreadsheet?`,
+      details: [`Tab: ${SHEET_TABS.RESIDENT_REGISTRY}`],
+      confirmLabel: existing ? 'Perbarui Data' : 'Simpan Data',
+    });
+    if (!confirmed) return;
+
+    isMutatingRef.current = true;
     try {
-      if (existingSnap.exists()) {
-        const updatePayload: Record<string, unknown> = {
-          fullName: data.fullName.trim().slice(0, 80),
-          houseBlock: data.houseBlock.trim().slice(0, 30),
-          role: effectiveRole,
-          residentStatus: effectiveRole === 'pengurus' ? 'pengurus' : data.residentStatus,
-          familyStatus: data.familyStatus,
-          updatedAt: serverTimestamp(),
-        };
-        if (isPengurusEntry && pengurusPosition && permissions) {
-          updatePayload.pengurusPosition = pengurusPosition;
-          updatePayload.permissions = permissions;
-        } else if (rbac.isFullAdmin) {
-          updatePayload.pengurusPosition = deleteField();
-          updatePayload.permissions = deleteField();
-        }
-        await updateDoc(ref, updatePayload);
-      } else {
-        await setDoc(ref, {
-          registryId,
-          fullName: data.fullName.trim().slice(0, 80),
-          houseBlock: data.houseBlock.trim().slice(0, 30),
-          role: effectiveRole,
-          ...(isPengurusEntry && pengurusPosition && permissions
-            ? { pengurusPosition, permissions }
-            : {}),
-          residentStatus: effectiveRole === 'pengurus' ? 'pengurus' : data.residentStatus,
-          familyStatus: data.familyStatus,
-          claimedUid: '',
-          claimedUsername: '',
-          communityId: 'rt_warga',
-          createdBy: currentUser.uid,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
-      }
+      const nowIso = new Date().toISOString();
+      const entry: ResidentRegistryEntry = existing
+        ? {
+            ...existing,
+            fullName: data.fullName.trim().slice(0, 80),
+            houseBlock: data.houseBlock.trim().slice(0, 30),
+            role: effectiveRole,
+            pengurusPosition: isPengurusEntry ? pengurusPosition : undefined,
+            permissions: isPengurusEntry ? permissions : undefined,
+            residentStatus: effectiveRole === 'pengurus' ? 'pengurus' : data.residentStatus,
+            familyStatus: data.familyStatus,
+            updatedAt: nowIso,
+          }
+        : {
+            registryId,
+            fullName: data.fullName.trim().slice(0, 80),
+            houseBlock: data.houseBlock.trim().slice(0, 30),
+            role: effectiveRole,
+            ...(isPengurusEntry && pengurusPosition && permissions
+              ? { pengurusPosition, permissions }
+              : {}),
+            residentStatus: effectiveRole === 'pengurus' ? 'pengurus' : data.residentStatus,
+            familyStatus: data.familyStatus,
+            claimedUid: '',
+            claimedUsername: '',
+            communityId: 'rt_warga',
+            createdBy: currentUser.uid,
+            createdAt: nowIso,
+            updatedAt: nowIso,
+          };
+
+      await upsertSheetRowsByKey(
+        token,
+        sheetInfo.spreadsheetId,
+        SHEET_TABS.RESIDENT_REGISTRY,
+        [registryEntryToRow(entry)]
+      );
+      await refreshSpreadsheetData(token, sheetInfo.spreadsheetId, true);
     } catch (err) {
-      handleFirestoreError(err, OperationType.WRITE, `resident_registry/${registryId}`);
+      if (err instanceof SheetsAuthExpiredError) handleExpiredToken();
+      else throw err;
+    } finally {
+      isMutatingRef.current = false;
     }
   };
 
@@ -1472,73 +2401,104 @@ export default function App() {
       familyStatus: FamilyStatus;
     }>
   ): Promise<number> => {
-    if (!currentUser) return 0;
-    const existingIds = new Set(registryEntries.map((e) => e.registryId));
-    let count = 0;
-    const batch = writeBatch(db);
-    for (const item of items.slice(0, 200)) {
-      const registryId = await computeResidentRegistryId(item.fullName, item.houseBlock);
-      const ref = doc(db, 'resident_registry', registryId);
-      const isPengurusEntry = item.role === 'pengurus' && rbac.isFullAdmin;
-      const effectiveRole: LoginRole = isPengurusEntry ? 'pengurus' : 'warga';
-      const pos: PengurusPosition | undefined = isPengurusEntry
-        ? item.pengurusPosition || 'pengurus_lain'
-        : undefined;
-      const perms: RbacPermission[] | undefined =
-        isPengurusEntry && pos
-          ? normalizePengurusPermissions(pos, item.permissions)
-          : undefined;
+    if (!currentUser || items.length === 0) return 0;
+    const token = getGoogleAccessToken();
+    if (!token || !sheetInfo?.spreadsheetId) {
+      requireActiveSheet();
+      return 0;
+    }
 
-      if (existingIds.has(registryId)) {
-        const updatePayload: Record<string, unknown> = {
-          fullName: item.fullName.trim().slice(0, 80),
-          houseBlock: item.houseBlock.trim().slice(0, 30),
-          role: effectiveRole,
-          residentStatus: effectiveRole === 'pengurus' ? 'pengurus' : item.residentStatus,
-          familyStatus: item.familyStatus,
-          updatedAt: serverTimestamp(),
-        };
-        if (isPengurusEntry && pos && perms) {
-          updatePayload.pengurusPosition = pos;
-          updatePayload.permissions = perms;
-        } else if (rbac.isFullAdmin) {
-          updatePayload.pengurusPosition = deleteField();
-          updatePayload.permissions = deleteField();
-        }
-        batch.update(ref, updatePayload);
-      } else {
-        existingIds.add(registryId);
-        batch.set(ref, {
-          registryId,
-          fullName: item.fullName.trim().slice(0, 80),
-          houseBlock: item.houseBlock.trim().slice(0, 30),
-          role: effectiveRole,
-          ...(isPengurusEntry && pos && perms
-            ? { pengurusPosition: pos, permissions: perms }
-            : {}),
-          residentStatus: effectiveRole === 'pengurus' ? 'pengurus' : item.residentStatus,
-          familyStatus: item.familyStatus,
-          claimedUid: '',
-          claimedUsername: '',
-          communityId: 'rt_warga',
-          createdBy: currentUser.uid,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
+    const slice = items.slice(0, 200);
+    const confirmed = await requestSheetConfirmation({
+      title: 'Impor Massal Database Warga ke Spreadsheet',
+      description: `Simpan/perbarui ${slice.length} data warga ke tab "${SHEET_TABS.RESIDENT_REGISTRY}" di Google Spreadsheet "${sheetInfo.spreadsheetTitle}"?`,
+      details: slice.slice(0, 5).map((i) => `${i.fullName} (${i.houseBlock})`),
+      confirmLabel: `Impor ${slice.length} Data`,
+    });
+    if (!confirmed) return 0;
+
+    isMutatingRef.current = true;
+    try {
+      const existingMap = new Map(registryEntries.map((e) => [e.registryId, e]));
+      const nowIso = new Date().toISOString();
+      const rowsToUpsert: string[][] = [];
+
+      for (const item of slice) {
+        const registryId = await computeResidentRegistryId(item.fullName, item.houseBlock);
+        const existing = existingMap.get(registryId);
+        const isPengurusEntry = item.role === 'pengurus' && rbac.isFullAdmin;
+        const effectiveRole: LoginRole = isPengurusEntry ? 'pengurus' : 'warga';
+        const pos: PengurusPosition | undefined = isPengurusEntry
+          ? item.pengurusPosition || 'pengurus_lain'
+          : undefined;
+        const perms: RbacPermission[] | undefined =
+          isPengurusEntry && pos
+            ? normalizePengurusPermissions(pos, item.permissions)
+            : undefined;
+
+        const entry: ResidentRegistryEntry = existing
+          ? {
+              ...existing,
+              fullName: item.fullName.trim().slice(0, 80),
+              houseBlock: item.houseBlock.trim().slice(0, 30),
+              role: effectiveRole,
+              pengurusPosition: isPengurusEntry ? pos : undefined,
+              permissions: isPengurusEntry ? perms : undefined,
+              residentStatus: effectiveRole === 'pengurus' ? 'pengurus' : item.residentStatus,
+              familyStatus: item.familyStatus,
+              updatedAt: nowIso,
+            }
+          : {
+              registryId,
+              fullName: item.fullName.trim().slice(0, 80),
+              houseBlock: item.houseBlock.trim().slice(0, 30),
+              role: effectiveRole,
+              ...(isPengurusEntry && pos && perms ? { pengurusPosition: pos, permissions: perms } : {}),
+              residentStatus: effectiveRole === 'pengurus' ? 'pengurus' : item.residentStatus,
+              familyStatus: item.familyStatus,
+              claimedUid: '',
+              claimedUsername: '',
+              communityId: 'rt_warga',
+              createdBy: currentUser.uid,
+              createdAt: nowIso,
+              updatedAt: nowIso,
+            };
+
+        existingMap.set(registryId, entry);
+        rowsToUpsert.push(registryEntryToRow(entry));
       }
-      count++;
+
+      if (rowsToUpsert.length > 0) {
+        await upsertSheetRowsByKey(
+          token,
+          sheetInfo.spreadsheetId,
+          SHEET_TABS.RESIDENT_REGISTRY,
+          rowsToUpsert
+        );
+        await refreshSpreadsheetData(token, sheetInfo.spreadsheetId, true);
+      }
+      return rowsToUpsert.length;
+    } catch (err) {
+      if (err instanceof SheetsAuthExpiredError) handleExpiredToken();
+      else throw err;
+      return 0;
+    } finally {
+      isMutatingRef.current = false;
     }
-    if (count > 0) {
-      await batch.commit();
-    }
-    return count;
   };
 
   const handleSyncExistingResidentsToRegistry = async (): Promise<number> => {
     if (!currentUser) return 0;
+    const token = getGoogleAccessToken();
+    if (!token || !sheetInfo?.spreadsheetId) {
+      handleExpiredToken();
+      return 0;
+    }
+
     const existingIds = new Set(registryEntries.map((e) => e.registryId));
-    const batch = writeBatch(db);
-    let added = 0;
+    const nowIso = new Date().toISOString();
+    const newEntries: ResidentRegistryEntry[] = [];
+
     for (const res of residents) {
       const registryId = await computeResidentRegistryId(res.displayName, res.houseBlock);
       if (existingIds.has(registryId)) continue;
@@ -1553,7 +2513,7 @@ export default function App() {
           ? normalizePengurusPermissions(pos, res.permissions)
           : undefined;
 
-      batch.set(doc(db, 'resident_registry', registryId), {
+      newEntries.push({
         registryId,
         fullName: res.displayName.slice(0, 80),
         houseBlock: res.houseBlock.slice(0, 30),
@@ -1567,15 +2527,38 @@ export default function App() {
         claimedUsername: res.username || '',
         communityId: 'rt_warga',
         createdBy: currentUser.uid,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
+        createdAt: nowIso,
+        updatedAt: nowIso,
       });
-      added++;
     }
-    if (added > 0) {
-      await batch.commit();
+
+    if (newEntries.length === 0) return 0;
+
+    const confirmed = await requestSheetConfirmation({
+      title: 'Sinkronkan Warga Aktif ke Database Warga',
+      description: `Tambahkan ${newEntries.length} profil warga aktif ke tab "${SHEET_TABS.RESIDENT_REGISTRY}" di Google Spreadsheet?`,
+      details: newEntries.slice(0, 5).map((e) => `${e.fullName} (${e.houseBlock})`),
+      confirmLabel: `Sinkronkan (${newEntries.length})`,
+    });
+    if (!confirmed) return 0;
+
+    isMutatingRef.current = true;
+    try {
+      await appendSheetRows(
+        token,
+        sheetInfo.spreadsheetId,
+        SHEET_TABS.RESIDENT_REGISTRY,
+        newEntries.map(registryEntryToRow)
+      );
+      await refreshSpreadsheetData(token, sheetInfo.spreadsheetId, true);
+      return newEntries.length;
+    } catch (err) {
+      if (err instanceof SheetsAuthExpiredError) handleExpiredToken();
+      else throw err;
+      return 0;
+    } finally {
+      isMutatingRef.current = false;
     }
-    return added;
   };
 
   const handleUpdateRegistryRbac = async (
@@ -1587,132 +2570,262 @@ export default function App() {
     }
   ) => {
     if (!rbac.isFullAdmin) return;
-    try {
-      const isPengurusNext = next.role === 'pengurus';
-      const pos: PengurusPosition = next.pengurusPosition || 'pengurus_lain';
-      const perms = isPengurusNext ? normalizePengurusPermissions(pos, next.permissions) : [];
+    const token = getGoogleAccessToken();
+    if (!token || !sheetInfo?.spreadsheetId) {
+      requireActiveSheet();
+      return;
+    }
 
-      await updateDoc(doc(db, 'resident_registry', entry.registryId), {
+    const isPengurusNext = next.role === 'pengurus';
+    const pos: PengurusPosition = next.pengurusPosition || 'pengurus_lain';
+    const perms = isPengurusNext ? normalizePengurusPermissions(pos, next.permissions) : [];
+
+    const confirmed = await requestSheetConfirmation({
+      title: 'Perbarui Role & Kewenangan RBAC di Spreadsheet',
+      description: `Ubah hak akses "${entry.fullName}" (${entry.houseBlock}) menjadi ${
+        isPengurusNext ? `Pengurus (${pos})` : 'Warga'
+      } pada Google Spreadsheet?`,
+      details: [
+        `Tab: ${SHEET_TABS.RESIDENT_REGISTRY}${
+          entry.claimedUid ? `, ${SHEET_TABS.USERS}, ${SHEET_TABS.ADMINS}` : ''
+        }`,
+      ],
+      confirmLabel: 'Simpan Kewenangan',
+    });
+    if (!confirmed) return;
+
+    isMutatingRef.current = true;
+    try {
+      const nowIso = new Date().toISOString();
+      const updatedReg: ResidentRegistryEntry = {
+        ...entry,
         role: next.role,
         residentStatus: isPengurusNext ? 'pengurus' : 'tetap',
-        pengurusPosition: isPengurusNext ? pos : deleteField(),
-        permissions: isPengurusNext ? perms : deleteField(),
-        updatedAt: serverTimestamp(),
-      });
+        pengurusPosition: isPengurusNext ? pos : undefined,
+        permissions: isPengurusNext ? perms : undefined,
+        updatedAt: nowIso,
+      };
+      await upsertSheetRowsByKey(
+        token,
+        sheetInfo.spreadsheetId,
+        SHEET_TABS.RESIDENT_REGISTRY,
+        [registryEntryToRow(updatedReg)]
+      );
 
       if (entry.claimedUid) {
-        await updateDoc(doc(db, 'users', entry.claimedUid), {
-          residentStatus: isPengurusNext ? 'pengurus' : 'tetap',
-          accountRole: next.role,
-          pengurusPosition: isPengurusNext ? pos : deleteField(),
-          permissions: isPengurusNext ? perms : deleteField(),
-          updatedAt: serverTimestamp(),
-        });
-
-        if (entry.claimedUsername) {
-          await updateDoc(doc(db, 'user_accounts', entry.claimedUsername), {
-            role: next.role,
-          }).catch(() => {});
+        const claimedProfile = residents.find((r) => r.uid === entry.claimedUid);
+        if (claimedProfile) {
+          await upsertSheetRowsByKey(token, sheetInfo.spreadsheetId, SHEET_TABS.USERS, [
+            userProfileToRow({
+              ...claimedProfile,
+              residentStatus: isPengurusNext ? 'pengurus' : 'tetap',
+              accountRole: next.role,
+              pengurusPosition: isPengurusNext ? pos : undefined,
+              permissions: isPengurusNext ? perms : undefined,
+              updatedAt: nowIso,
+            }),
+          ]);
         }
 
-        const adminRef = doc(db, 'admins', entry.claimedUid);
-        if (isPengurusNext) {
-          const existingAdminSnap = await getDoc(adminRef);
-          if (existingAdminSnap.exists()) {
-            await updateDoc(adminRef, {
-              name: entry.fullName.slice(0, 80),
-              role: pos,
-              permissions: perms,
-              registryId: entry.registryId,
-            });
-          } else {
-            await setDoc(adminRef, {
-              uid: entry.claimedUid,
-              email: entry.claimedUsername
-                ? usernameToAuthEmail(entry.claimedUsername)
-                : `${entry.claimedUid}@akun.siskeurt12.id`,
-              name: entry.fullName.slice(0, 80),
-              role: pos,
-              permissions: perms,
-              registryId: entry.registryId,
-              createdAt: serverTimestamp(),
-            });
+        if (entry.claimedUsername) {
+          const claimedAcc = userAccounts.find(
+            (a) => normalizeUsername(a.username) === normalizeUsername(entry.claimedUsername || '')
+          );
+          if (claimedAcc) {
+            await upsertSheetRowsByKey(token, sheetInfo.spreadsheetId, SHEET_TABS.USER_ACCOUNTS, [
+              userAccountToRow({
+                ...claimedAcc,
+                role: next.role,
+              }),
+            ]);
           }
+        }
+
+        if (isPengurusNext) {
+          const existingAdmin = adminRecords.find((a) => a.uid === entry.claimedUid);
+          const nextAdmin: AdminRoleRecord = {
+            uid: entry.claimedUid,
+            email:
+              existingAdmin?.email ||
+              (entry.claimedUsername
+                ? usernameToAuthEmail(entry.claimedUsername)
+                : `${entry.claimedUid}@akun.siskeurt12.id`),
+            name: entry.fullName.slice(0, 80),
+            role: pos,
+            permissions: perms,
+            registryId: entry.registryId,
+            createdAt: existingAdmin?.createdAt || nowIso,
+          };
+          await upsertSheetRowsByKey(token, sheetInfo.spreadsheetId, SHEET_TABS.ADMINS, [
+            adminRecordToRow(nextAdmin),
+          ]);
           if (entry.claimedUid === currentUser?.uid) {
-            setAdminRecord({
-              uid: entry.claimedUid,
-              email: adminRecord?.email || currentUser.email || '',
-              name: entry.fullName.slice(0, 80),
-              role: pos,
-              permissions: perms,
-              registryId: entry.registryId,
-            });
+            setAdminRecord(nextAdmin);
           }
         } else {
-          try {
-            await deleteDoc(adminRef);
-          } catch {
-            // Ignore if current user cannot delete own or non-existent admin doc
-          }
+          await deleteSheetRowsByKey(token, sheetInfo.spreadsheetId, SHEET_TABS.ADMINS, [
+            entry.claimedUid,
+          ]);
           if (entry.claimedUid === currentUser?.uid && !isBootstrappedAdminUser) {
             setAdminRecord(null);
           }
         }
       }
+
+      await refreshSpreadsheetData(token, sheetInfo.spreadsheetId, true);
     } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, `resident_registry/${entry.registryId}`);
+      if (err instanceof SheetsAuthExpiredError) handleExpiredToken();
+      else throw err;
+    } finally {
+      isMutatingRef.current = false;
     }
   };
 
   const handleResetRegistryClaim = async (entry: ResidentRegistryEntry) => {
+    const token = getGoogleAccessToken();
+    if (!token || !sheetInfo?.spreadsheetId) {
+      requireActiveSheet();
+      return;
+    }
+
+    const confirmed = await requestSheetConfirmation({
+      title: 'Reset Klaim Akun di Google Spreadsheet',
+      description: `Reset status pendaftaran akun untuk "${entry.fullName}" (${entry.houseBlock}) dan hapus username "@${
+        entry.claimedUsername || '-'
+      }" dari tab ${SHEET_TABS.USER_ACCOUNTS} agar warga dapat mendaftar ulang?`,
+      details: [`Tab: ${SHEET_TABS.RESIDENT_REGISTRY}, ${SHEET_TABS.USER_ACCOUNTS}`],
+      confirmLabel: 'Reset Klaim Akun',
+      destructive: true,
+    });
+    if (!confirmed) return;
+
+    isMutatingRef.current = true;
     try {
-      const batch = writeBatch(db);
-      batch.update(doc(db, 'resident_registry', entry.registryId), {
+      const updated: ResidentRegistryEntry = {
+        ...entry,
         claimedUid: '',
         claimedUsername: '',
-        updatedAt: serverTimestamp(),
-      });
+        updatedAt: new Date().toISOString(),
+      };
+      await upsertSheetRowsByKey(
+        token,
+        sheetInfo.spreadsheetId,
+        SHEET_TABS.RESIDENT_REGISTRY,
+        [registryEntryToRow(updated)]
+      );
       if (entry.claimedUsername) {
-        batch.delete(doc(db, 'user_accounts', entry.claimedUsername));
+        await deleteSheetRowsByKey(token, sheetInfo.spreadsheetId, SHEET_TABS.USER_ACCOUNTS, [
+          entry.claimedUsername,
+        ]);
       }
-      await batch.commit();
+      await refreshSpreadsheetData(token, sheetInfo.spreadsheetId, true);
     } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, `resident_registry/${entry.registryId}`);
+      if (err instanceof SheetsAuthExpiredError) handleExpiredToken();
+      else throw err;
+    } finally {
+      isMutatingRef.current = false;
     }
   };
 
   const handleDeleteRegistryEntry = async (entry: ResidentRegistryEntry) => {
+    const token = getGoogleAccessToken();
+    if (!token || !sheetInfo?.spreadsheetId) {
+      requireActiveSheet();
+      return;
+    }
+
+    const confirmed = await requestSheetConfirmation({
+      title: 'Hapus Warga dari Google Spreadsheet',
+      description: `Anda yakin ingin menghapus data "${entry.fullName}" (${entry.houseBlock}) secara permanen dari Database Warga di Google Spreadsheet?`,
+      details: [
+        `Tab: ${SHEET_TABS.RESIDENT_REGISTRY}${
+          entry.claimedUsername ? `, ${SHEET_TABS.USER_ACCOUNTS}` : ''
+        }`,
+      ],
+      confirmLabel: 'Ya, Hapus Data',
+      destructive: true,
+    });
+    if (!confirmed) return;
+
+    isMutatingRef.current = true;
     try {
-      const batch = writeBatch(db);
-      batch.delete(doc(db, 'resident_registry', entry.registryId));
+      await deleteSheetRowsByKey(token, sheetInfo.spreadsheetId, SHEET_TABS.RESIDENT_REGISTRY, [
+        entry.registryId,
+      ]);
       if (entry.claimedUsername) {
-        batch.delete(doc(db, 'user_accounts', entry.claimedUsername));
+        await deleteSheetRowsByKey(token, sheetInfo.spreadsheetId, SHEET_TABS.USER_ACCOUNTS, [
+          entry.claimedUsername,
+        ]);
       }
-      await batch.commit();
+      await refreshSpreadsheetData(token, sheetInfo.spreadsheetId, true);
     } catch (err) {
-      handleFirestoreError(err, OperationType.DELETE, `resident_registry/${entry.registryId}`);
+      if (err instanceof SheetsAuthExpiredError) handleExpiredToken();
+      else throw err;
+    } finally {
+      isMutatingRef.current = false;
     }
   };
 
   const handleMarkNotificationRead = async (id: string) => {
+    const token = getGoogleAccessToken();
+    if (!token || !sheetInfo?.spreadsheetId) {
+      requireActiveSheet();
+      return;
+    }
+    const target = allNotifications.find((n) => n.id === id);
+    if (!target || target.isRead) return;
+
+    const confirmed = await requestSheetConfirmation({
+      title: 'Tandai Notifikasi Dibaca',
+      description: `Perbarui status notifikasi "${target.title}" menjadi sudah dibaca pada Google Spreadsheet?`,
+      details: [`Tab: ${SHEET_TABS.NOTIFICATIONS}`],
+      confirmLabel: 'Tandai Dibaca',
+    });
+    if (!confirmed) return;
+
+    isMutatingRef.current = true;
     try {
-      await updateDoc(doc(db, 'notifications', id), { isRead: true });
+      await upsertSheetRowsByKey(token, sheetInfo.spreadsheetId, SHEET_TABS.NOTIFICATIONS, [
+        notificationToRow({ ...target, isRead: true }),
+      ]);
+      await refreshSpreadsheetData(token, sheetInfo.spreadsheetId, true);
     } catch (err) {
-      handleFirestoreError(err, OperationType.UPDATE, `notifications/${id}`);
+      if (err instanceof SheetsAuthExpiredError) handleExpiredToken();
+    } finally {
+      isMutatingRef.current = false;
     }
   };
 
   const handleMarkAllRead = async () => {
     const unread = notifications.filter((n) => !n.isRead);
     if (unread.length === 0) return;
+    const token = getGoogleAccessToken();
+    if (!token || !sheetInfo?.spreadsheetId) {
+      requireActiveSheet();
+      return;
+    }
+
+    const confirmed = await requestSheetConfirmation({
+      title: 'Tandai Semua Notifikasi Dibaca',
+      description: `Perbarui ${unread.length} notifikasi menjadi sudah dibaca di Google Spreadsheet?`,
+      details: [`Tab: ${SHEET_TABS.NOTIFICATIONS}`],
+      confirmLabel: `Tandai ${unread.length} Dibaca`,
+    });
+    if (!confirmed) return;
+
+    isMutatingRef.current = true;
     try {
-      const batch = writeBatch(db);
-      for (const n of unread) {
-        batch.update(doc(db, 'notifications', n.id), { isRead: true });
-      }
-      await batch.commit();
+      await upsertSheetRowsByKey(
+        token,
+        sheetInfo.spreadsheetId,
+        SHEET_TABS.NOTIFICATIONS,
+        unread.map((n) => notificationToRow({ ...n, isRead: true }))
+      );
+      await refreshSpreadsheetData(token, sheetInfo.spreadsheetId, true);
     } catch (err) {
-      handleFirestoreError(err, OperationType.WRITE, 'notifications');
+      if (err instanceof SheetsAuthExpiredError) handleExpiredToken();
+    } finally {
+      isMutatingRef.current = false;
     }
   };
 
@@ -1726,302 +2839,405 @@ export default function App() {
           <p className="font-display text-lg font-extrabold text-slate-900 dark:text-slate-100">
             SISKEU RT12/RW20 SUKATANI
           </p>
-          <p className="text-sm text-slate-500 dark:text-slate-400">Menyiapkan data warga...</p>
+          <p className="text-sm text-slate-500 dark:text-slate-400">
+            Menyiapkan koneksi Google Spreadsheet...
+          </p>
         </div>
       </div>
     );
   }
 
-  if (!currentUser || !profile) {
-    return (
-      <LoginScreen
-        onLoginWithCredentials={handleLoginWithCredentials}
-        onRegisterAccount={handleRegisterAccount}
-        onGoogleAdminLogin={handleGoogleAdminLogin}
-        isLoggingIn={isLoggingIn}
-        loginError={loginError}
-        onClearError={() => setLoginError(null)}
-        darkMode={darkMode}
-        onToggleDarkMode={() => setDarkMode((d) => !d)}
-        elderlyMode={elderlyMode}
-        onToggleElderlyMode={() => setElderlyMode((e) => !e)}
-        isOnline={isOnline}
-        bannerSlides={bannerSlides}
-      />
-    );
-  }
-
-  // Merge offline queued items for transparent immediate visibility
-  const offlineItems = getOfflineQueue();
-  const mergedTransactions: KasTransaction[] = [
-    ...offlineItems
-      .filter((q) => q.kind === 'dues_submission')
-      .map((q) => ({
-        id: q.localId,
-        ...(q.payload as Omit<KasTransaction, 'id'>),
-        createdAt: q.createdAtIso,
-        isOfflinePending: true,
-      })),
-    ...transactions,
-  ];
-  const mergedEmergencies: EmergencyAlert[] = [
-    ...offlineItems
-      .filter((q) => q.kind === 'emergency_alert')
-      .map((q) => ({
-        id: q.localId,
-        ...(q.payload as Omit<EmergencyAlert, 'id'>),
-        createdAt: q.createdAtIso,
-        isOfflinePending: true,
-      })),
-    ...emergencies,
-  ];
-
-  const activeEmergencyCount = mergedEmergencies.filter((e) => e.status !== 'resolved').length;
-
   return (
-    <div className="min-h-screen bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 pb-24 lg:pb-12">
-      <HeaderNav
-        activeTab={activeTab}
-        onNavigate={(tab) => {
-          setActiveTab(tab);
-          setOpenPaymentModalOnKas(false);
-        }}
-        notifications={notifications}
-        onMarkNotificationRead={handleMarkNotificationRead}
-        onMarkAllRead={handleMarkAllRead}
-        onOpenSettings={() => setSettingsOpen(true)}
-        activeEmergencyCount={activeEmergencyCount}
-      />
-
-      {/* Non-intrusive Real-Time Toast Banner */}
-      {liveToast && (
-        <div
-          role="status"
-          className={`fixed top-16 right-4 z-50 max-w-sm w-[calc(100%-2rem)] rounded-2xl p-4 shadow-xl border flex items-start gap-3 ${
-            liveToast.urgent
-              ? 'bg-red-600 text-white border-red-500'
-              : 'bg-slate-900 dark:bg-slate-800 text-white border-slate-700'
-          }`}
-        >
-          <BellRing className="w-5 h-5 shrink-0 mt-0.5" />
-          <div className="flex-1 min-w-0">
-            <p className="text-sm font-bold">{liveToast.title}</p>
-            <p className="text-xs opacity-90 mt-0.5 line-clamp-2">{liveToast.body}</p>
-          </div>
-          <button
-            type="button"
-            onClick={() => setLiveToast(null)}
-            aria-label="Tutup pemberitahuan"
-            className="min-h-[36px] min-w-[36px] flex items-center justify-center rounded-lg hover:bg-white/10"
-          >
-            <X className="w-4 h-4" />
-          </button>
-        </div>
-      )}
-
-      {/* Offline / Pending Sync Notice */}
-      {(!isOnline || offlineQueueCount > 0) && (
-        <div className="max-w-6xl mx-auto px-4 sm:px-6 pt-4 print:hidden">
-          <div className="rounded-xl bg-amber-50 dark:bg-amber-950/50 border border-amber-200 dark:border-amber-800 px-4 py-3 flex items-center justify-between gap-3 text-xs sm:text-sm text-amber-900 dark:text-amber-200">
-            <div className="flex items-center gap-2.5">
-              <WifiOff className="w-4 h-4 shrink-0" />
-              <span>
-                {!isOnline
-                  ? 'Mode Offline Aktif — Data kas & profil darurat tetap dapat diakses. Perubahan akan disinkronkan otomatis saat online.'
-                  : `${offlineQueueCount} data offline siap disinkronkan ke cloud.`}
-              </span>
-            </div>
-            {isOnline && offlineQueueCount > 0 && (
-              <button
-                type="button"
-                onClick={() => void flushOfflineQueue()}
-                className="min-h-[36px] px-3 rounded-lg bg-amber-600 text-white font-semibold text-xs inline-flex items-center gap-1.5 shrink-0"
-              >
-                <RefreshCw className="w-3.5 h-3.5" />
-                <span>Sinkronkan</span>
-              </button>
-            )}
-          </div>
-        </div>
-      )}
-
-      {/* Non-blocking New User Interactive Tutorial Banner */}
-      {showNewUserBanner && (
-        <div className="max-w-6xl mx-auto px-4 sm:px-6 pt-4 print:hidden">
-          <div className="rounded-2xl bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-            <div className="flex items-start gap-3">
-              <BookOpen className="w-5 h-5 text-emerald-700 dark:text-emerald-400 shrink-0 mt-0.5" />
-              <div>
-                <p className="text-sm font-bold text-slate-900 dark:text-slate-100">
-                  Selamat datang di KasWarga RT! Baru pertama kali menggunakan aplikasi?
-                </p>
-                <p className="text-xs text-slate-600 dark:text-slate-300 mt-0.5">
-                  Ikuti panduan interaktif 1 menit untuk mengenal cara bayar iuran, cek laporan, dan tombol darurat SOS.
-                </p>
-              </div>
-            </div>
-            <div className="flex items-center gap-2 shrink-0">
-              <button
-                type="button"
-                onClick={() => {
-                  localStorage.setItem(`kaswarga_seen_intro_${currentUser.uid}`, '1');
-                  setShowNewUserBanner(false);
-                  setTutorialOpen(true);
-                }}
-                className="min-h-[44px] px-4 rounded-xl bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-semibold whitespace-nowrap"
-              >
-                Mulai Panduan
-              </button>
-              <button
-                type="button"
-                onClick={() => {
-                  localStorage.setItem(`kaswarga_seen_intro_${currentUser.uid}`, '1');
-                  setShowNewUserBanner(false);
-                }}
-                className="min-h-[44px] px-3 rounded-xl text-xs font-semibold text-slate-600 dark:text-slate-300 hover:bg-emerald-100/60 dark:hover:bg-emerald-900/40"
-              >
-                Nanti Saja
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      <main className="max-w-6xl mx-auto px-4 sm:px-6 py-6 sm:py-8">
-        <motion.div
-          key={activeTab}
-          initial={{ opacity: 0, y: 6 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.18, ease: [0.16, 1, 0.3, 1] }}
-        >
-          {activeTab === 'beranda' && (
-            <DashboardView
-              profile={profile}
-              rbac={rbac}
-              rtSettings={rtSettings}
-              transactions={mergedTransactions}
-              residents={residents}
-              announcements={announcements}
-              emergencies={mergedEmergencies}
-              onNavigate={setActiveTab}
-              onOpenTutorial={() => setTutorialOpen(true)}
-              onQuickPayDues={() => {
-                setOpenPaymentModalOnKas(true);
-                setActiveTab('kas');
-              }}
-            />
-          )}
-
-          {activeTab === 'kas' && (
-            <CashflowAndDuesView
-              profile={profile}
-              residents={residents}
-              canManageKas={rbac.canManageKas}
-              isOnline={isOnline}
-              rtSettings={rtSettings}
-              transactions={mergedTransactions}
-              openPaymentModalInitially={openPaymentModalOnKas}
-              onCloseInitialPaymentModal={() => setOpenPaymentModalOnKas(false)}
-              onSubmitDues={handleSubmitDues}
-              onAdminCreateTransaction={handleAdminCreateTransaction}
-              onAdminVerifyTransaction={handleAdminVerifyTransaction}
-            />
-          )}
-
-          {activeTab === 'laporan' && (
-            <MonthlyReportView
-              canManageReports={rbac.canManageReports}
-              canManageResidents={rbac.canManageResidents}
-              rtSettings={rtSettings}
-              transactions={mergedTransactions}
-              residents={residents}
-              onSendPaymentReminders={handleSendPaymentReminders}
-              onOpenResidentRegistry={() => setRegistryOpen(true)}
-            />
-          )}
-
-          {activeTab === 'pengumuman' && (
-            <AnnouncementsView
-              canManageAnnouncements={rbac.canManageAnnouncements}
-              announcements={announcements}
-              onPublishAnnouncement={handlePublishAnnouncement}
-              onDeleteAnnouncement={handleDeleteAnnouncement}
-            />
-          )}
-
-          {activeTab === 'darurat' && (
-            <EmergencyAndHealthView
-              profile={profile}
-              canManageEmergencies={rbac.canManageEmergencies}
-              isOnline={isOnline}
-              rtSettings={rtSettings}
-              emergencies={mergedEmergencies}
-              privateProfile={privateProfile}
-              healthProfile={healthProfile}
-              onTriggerSOS={handleTriggerSOS}
-              onUpdateEmergencyStatus={handleUpdateEmergencyStatus}
-              onSaveEncryptedHealthAndProfile={handleSaveEncryptedHealthAndProfile}
-            />
-          )}
-        </motion.div>
-      </main>
-
-      <MobileBottomNav
-        activeTab={activeTab}
-        onNavigate={(tab) => {
-          setActiveTab(tab);
-          setOpenPaymentModalOnKas(false);
-        }}
-        activeEmergencyCount={activeEmergencyCount}
-      />
-
-      <OnboardingTutorial
-        isOpen={tutorialOpen}
-        onClose={() => setTutorialOpen(false)}
-        onNavigate={setActiveTab}
-      />
-
-      <ProfileSettingsModal
-        isOpen={settingsOpen}
-        onClose={() => setSettingsOpen(false)}
-        profile={profile}
-        userEmail={currentUser.email || ''}
-        rbac={rbac}
-        darkMode={darkMode}
-        onToggleDarkMode={() => setDarkMode((d) => !d)}
-        elderlyMode={elderlyMode}
-        onToggleElderlyMode={() => void handleToggleElderlyMode()}
-        rtSettings={rtSettings}
-        transactions={mergedTransactions}
-        bannerSlides={bannerSlides}
-        registryCount={registryEntries.length}
-        onOpenResidentRegistry={() => setRegistryOpen(true)}
-        onSaveProfile={handleSaveProfile}
-        onSaveRtSettings={handleSaveRtSettings}
-        onAddBannerSlide={handleAddBannerSlide}
-        onUpdateBannerSlide={handleUpdateBannerSlide}
-        onMoveBannerSlide={handleMoveBannerSlide}
-        onDeleteBannerSlide={handleDeleteBannerSlide}
-        onOpenTutorial={() => setTutorialOpen(true)}
-        onLogout={handleLogout}
-      />
-
-      {rbac.canManageResidents && (
-        <ResidentRegistryModal
-          isOpen={registryOpen}
-          onClose={() => setRegistryOpen(false)}
-          canManageRbac={rbac.isFullAdmin}
-          currentUserUid={currentUser.uid}
-          registryEntries={registryEntries}
-          existingResidents={residents}
-          onAddEntry={handleAddRegistryEntry}
-          onBulkImport={handleBulkImportRegistry}
-          onSyncExistingResidents={handleSyncExistingResidentsToRegistry}
-          onUpdateRbac={handleUpdateRegistryRbac}
-          onResetClaim={handleResetRegistryClaim}
-          onDeleteEntry={handleDeleteRegistryEntry}
+    <>
+      {!currentUser || !profile ? (
+        <LoginScreen
+          googleConnected={googleConnected}
+          googleUserEmail={googleUserEmail}
+          sheetInfo={sheetInfo}
+          isConnectingSheet={isConnectingSheet || isSyncing}
+          onGoogleConnect={handleGoogleConnect}
+          onGoogleDisconnect={handleGoogleDisconnect}
+          onConnectSpreadsheetById={handleConnectSpreadsheetById}
+          onSyncSpreadsheet={async () => {
+            await refreshSpreadsheetData(undefined, undefined, false);
+          }}
+          onLoginWithCredentials={handleLoginWithCredentials}
+          onRegisterAccount={handleRegisterAccount}
+          onGoogleAdminLogin={handleGoogleAdminLogin}
+          isLoggingIn={isLoggingIn}
+          loginError={loginError}
+          onClearError={() => setLoginError(null)}
+          darkMode={darkMode}
+          onToggleDarkMode={() => setDarkMode((d) => !d)}
+          elderlyMode={elderlyMode}
+          onToggleElderlyMode={() => setElderlyMode((e) => !e)}
+          isOnline={isOnline}
+          bannerSlides={bannerSlides}
         />
+      ) : (
+        (() => {
+          const offlineItems = getOfflineQueue();
+          const mergedTransactions: KasTransaction[] = [
+            ...offlineItems
+              .filter((q) => q.kind === 'dues_submission')
+              .map((q) => ({
+                id: q.localId,
+                ...(q.payload as Omit<KasTransaction, 'id'>),
+                createdAt: q.createdAtIso,
+                isOfflinePending: true,
+              })),
+            ...transactions,
+          ];
+          const mergedEmergencies: EmergencyAlert[] = [
+            ...offlineItems
+              .filter((q) => q.kind === 'emergency_alert')
+              .map((q) => ({
+                id: q.localId,
+                ...(q.payload as Omit<EmergencyAlert, 'id'>),
+                createdAt: q.createdAtIso,
+                isOfflinePending: true,
+              })),
+            ...emergencies,
+          ];
+
+          const activeEmergencyCount = mergedEmergencies.filter(
+            (e) => e.status !== 'resolved'
+          ).length;
+
+          return (
+            <div className="min-h-screen bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 pb-24 lg:pb-12">
+              <HeaderNav
+                activeTab={activeTab}
+                onNavigate={(tab) => {
+                  setActiveTab(tab);
+                  setOpenPaymentModalOnKas(false);
+                }}
+                notifications={notifications}
+                onMarkNotificationRead={handleMarkNotificationRead}
+                onMarkAllRead={handleMarkAllRead}
+                onOpenSettings={() => setSettingsOpen(true)}
+                activeEmergencyCount={activeEmergencyCount}
+                onSyncSheets={() => void refreshSpreadsheetData(undefined, undefined, false)}
+                isSyncing={isSyncing}
+              />
+
+              {/* Non-intrusive Real-Time Toast Banner */}
+              {liveToast && (
+                <div
+                  role="status"
+                  className={`fixed top-16 right-4 z-50 max-w-sm w-[calc(100%-2rem)] rounded-2xl p-4 shadow-xl border flex items-start gap-3 ${
+                    liveToast.urgent
+                      ? 'bg-red-600 text-white border-red-500'
+                      : 'bg-slate-900 dark:bg-slate-800 text-white border-slate-700'
+                  }`}
+                >
+                  <BellRing className="w-5 h-5 shrink-0 mt-0.5" />
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-bold">{liveToast.title}</p>
+                    <p className="text-xs opacity-90 mt-0.5 line-clamp-2">{liveToast.body}</p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setLiveToast(null)}
+                    aria-label="Tutup pemberitahuan"
+                    className="min-h-[36px] min-w-[36px] flex items-center justify-center rounded-lg hover:bg-white/10"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+              )}
+
+              {/* Offline / Pending Sync Notice */}
+              {(!isOnline || offlineQueueCount > 0) && (
+                <div className="max-w-6xl mx-auto px-4 sm:px-6 pt-4 print:hidden">
+                  <div className="rounded-xl bg-amber-50 dark:bg-amber-950/50 border border-amber-200 dark:border-amber-800 px-4 py-3 flex items-center justify-between gap-3 text-xs sm:text-sm text-amber-900 dark:text-amber-200">
+                    <div className="flex items-center gap-2.5">
+                      <WifiOff className="w-4 h-4 shrink-0" />
+                      <span>
+                        {!isOnline
+                          ? 'Mode Offline Aktif — Data kas & profil darurat tetap dapat diakses. Perubahan siap disinkronkan ke Google Spreadsheet saat online.'
+                          : `${offlineQueueCount} data offline siap disinkronkan ke Google Spreadsheet.`}
+                      </span>
+                    </div>
+                    {isOnline && offlineQueueCount > 0 && (
+                      <button
+                        type="button"
+                        onClick={() => void flushOfflineQueue()}
+                        className="min-h-[36px] px-3 rounded-lg bg-amber-600 text-white font-semibold text-xs inline-flex items-center gap-1.5 shrink-0 cursor-pointer"
+                      >
+                        <RefreshCw className="w-3.5 h-3.5" />
+                        <span>Sinkronkan</span>
+                      </button>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {/* Non-blocking New User Interactive Tutorial Banner */}
+              {showNewUserBanner && (
+                <div className="max-w-6xl mx-auto px-4 sm:px-6 pt-4 print:hidden">
+                  <div className="rounded-2xl bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                    <div className="flex items-start gap-3">
+                      <BookOpen className="w-5 h-5 text-emerald-700 dark:text-emerald-400 shrink-0 mt-0.5" />
+                      <div>
+                        <p className="text-sm font-bold text-slate-900 dark:text-slate-100">
+                          Selamat datang di KasWarga RT! Baru pertama kali menggunakan aplikasi?
+                        </p>
+                        <p className="text-xs text-slate-600 dark:text-slate-300 mt-0.5">
+                          Ikuti panduan interaktif 1 menit untuk mengenal cara bayar iuran, cek laporan, dan tombol darurat SOS.
+                        </p>
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          localStorage.setItem(`kaswarga_seen_intro_${currentUser.uid}`, '1');
+                          setShowNewUserBanner(false);
+                          setTutorialOpen(true);
+                        }}
+                        className="min-h-[44px] px-4 rounded-xl bg-emerald-700 hover:bg-emerald-800 text-white text-xs font-semibold whitespace-nowrap cursor-pointer"
+                      >
+                        Mulai Panduan
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          localStorage.setItem(`kaswarga_seen_intro_${currentUser.uid}`, '1');
+                          setShowNewUserBanner(false);
+                        }}
+                        className="min-h-[44px] px-3 rounded-xl text-xs font-semibold text-slate-600 dark:text-slate-300 hover:bg-emerald-100/60 dark:hover:bg-emerald-900/40 cursor-pointer"
+                      >
+                        Nanti Saja
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {/* Admin Database Setup Panel (only after Admin login when no Spreadsheet exists) */}
+              {!sheetInfo && (
+                <div className="max-w-6xl mx-auto px-4 sm:px-6 pt-4 print:hidden">
+                  {rbac.isFullAdmin ? (
+                    <div className="rounded-2xl bg-emerald-50/90 dark:bg-emerald-950/40 border border-emerald-300 dark:border-emerald-800 p-4 sm:p-5 space-y-3.5 shadow-xs">
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                        <div className="flex items-start gap-3">
+                          <div className="w-10 h-10 rounded-xl bg-emerald-700 text-white flex items-center justify-center shrink-0">
+                            <FileSpreadsheet className="w-5 h-5" />
+                          </div>
+                          <div>
+                            <p className="text-sm font-extrabold text-slate-900 dark:text-slate-100">
+                              Database Google Spreadsheet Belum Dibuat
+                            </p>
+                            <p className="text-xs text-slate-600 dark:text-slate-300 mt-0.5 leading-relaxed">
+                              Anda sudah masuk sebagai Admin ({rbac.positionLabel}). Buat database Google Spreadsheet baru di Google Drive Anda atau hubungkan Spreadsheet RT yang sudah ada.
+                            </p>
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          disabled={isConnectingSheet || !isOnline}
+                          onClick={() => void handleCreateSpreadsheet()}
+                          className="min-h-[44px] px-4 rounded-xl bg-emerald-700 hover:bg-emerald-800 disabled:opacity-50 text-white text-xs sm:text-sm font-bold inline-flex items-center justify-center gap-2 shrink-0 cursor-pointer"
+                        >
+                          <FolderPlus className="w-4 h-4 shrink-0" />
+                          <span>
+                            {isConnectingSheet
+                              ? 'Menyiapkan Spreadsheet...'
+                              : 'Buat Database Spreadsheet Baru'}
+                          </span>
+                        </button>
+                      </div>
+
+                      <div className="flex flex-col sm:flex-row gap-2 pt-2 border-t border-emerald-200/70 dark:border-emerald-800/70">
+                        <input
+                          type="text"
+                          value={adminSheetInput}
+                          onChange={(e) => setAdminSheetInput(e.target.value)}
+                          placeholder="Atau tempel URL / ID Google Spreadsheet RT yang sudah ada..."
+                          className="flex-1 min-w-0 min-h-[40px] px-3.5 rounded-xl border border-emerald-200 dark:border-emerald-800 bg-white dark:bg-slate-900 text-xs"
+                        />
+                        <button
+                          type="button"
+                          disabled={isConnectingSheet || !adminSheetInput.trim() || !isOnline}
+                          onClick={async () => {
+                            await handleConnectSpreadsheetById(adminSheetInput);
+                            setAdminSheetInput('');
+                          }}
+                          className="min-h-[40px] px-4 rounded-xl bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900 text-xs font-bold inline-flex items-center justify-center gap-1.5 shrink-0 disabled:opacity-50 cursor-pointer"
+                        >
+                          <Link2 className="w-3.5 h-3.5" />
+                          <span>Hubungkan Spreadsheet</span>
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="rounded-xl bg-amber-50 dark:bg-amber-950/50 border border-amber-200 dark:border-amber-800 px-4 py-3 text-xs sm:text-sm text-amber-900 dark:text-amber-200">
+                      Database Google Spreadsheet belum terhubung. Silakan hubungi Ketua RT untuk membuat atau membagikan Spreadsheet RT.
+                    </div>
+                  )}
+                </div>
+              )}
+
+              <main className="max-w-6xl mx-auto px-4 sm:px-6 py-6 sm:py-8">
+                <motion.div
+                  key={activeTab}
+                  initial={{ opacity: 0, y: 6 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  transition={{ duration: 0.18, ease: [0.16, 1, 0.3, 1] }}
+                >
+                  {activeTab === 'beranda' && (
+                    <DashboardView
+                      profile={profile}
+                      rbac={rbac}
+                      rtSettings={rtSettings}
+                      transactions={mergedTransactions}
+                      residents={residents}
+                      announcements={announcements}
+                      emergencies={mergedEmergencies}
+                      onNavigate={setActiveTab}
+                      onOpenTutorial={() => setTutorialOpen(true)}
+                      onQuickPayDues={() => {
+                        setOpenPaymentModalOnKas(true);
+                        setActiveTab('kas');
+                      }}
+                    />
+                  )}
+
+                  {activeTab === 'kas' && (
+                    <CashflowAndDuesView
+                      profile={profile}
+                      residents={residents}
+                      canManageKas={rbac.canManageKas}
+                      isOnline={isOnline}
+                      rtSettings={rtSettings}
+                      transactions={mergedTransactions}
+                      openPaymentModalInitially={openPaymentModalOnKas}
+                      onCloseInitialPaymentModal={() => setOpenPaymentModalOnKas(false)}
+                      onSubmitDues={handleSubmitDues}
+                      onAdminCreateTransaction={handleAdminCreateTransaction}
+                      onAdminVerifyTransaction={handleAdminVerifyTransaction}
+                    />
+                  )}
+
+                  {activeTab === 'laporan' && (
+                    <MonthlyReportView
+                      canManageReports={rbac.canManageReports}
+                      canManageResidents={rbac.canManageResidents}
+                      rtSettings={rtSettings}
+                      transactions={mergedTransactions}
+                      residents={residents}
+                      onSendPaymentReminders={handleSendPaymentReminders}
+                      onOpenResidentRegistry={() => setRegistryOpen(true)}
+                    />
+                  )}
+
+                  {activeTab === 'pengumuman' && (
+                    <AnnouncementsView
+                      canManageAnnouncements={rbac.canManageAnnouncements}
+                      announcements={announcements}
+                      onPublishAnnouncement={handlePublishAnnouncement}
+                      onDeleteAnnouncement={handleDeleteAnnouncement}
+                    />
+                  )}
+
+                  {activeTab === 'darurat' && (
+                    <EmergencyAndHealthView
+                      profile={profile}
+                      canManageEmergencies={rbac.canManageEmergencies}
+                      isOnline={isOnline}
+                      rtSettings={rtSettings}
+                      emergencies={mergedEmergencies}
+                      privateProfile={privateProfile}
+                      healthProfile={healthProfile}
+                      onTriggerSOS={handleTriggerSOS}
+                      onUpdateEmergencyStatus={handleUpdateEmergencyStatus}
+                      onSaveEncryptedHealthAndProfile={handleSaveEncryptedHealthAndProfile}
+                    />
+                  )}
+                </motion.div>
+              </main>
+
+              <MobileBottomNav
+                activeTab={activeTab}
+                onNavigate={(tab) => {
+                  setActiveTab(tab);
+                  setOpenPaymentModalOnKas(false);
+                }}
+                activeEmergencyCount={activeEmergencyCount}
+              />
+
+              <OnboardingTutorial
+                isOpen={tutorialOpen}
+                onClose={() => setTutorialOpen(false)}
+                onNavigate={setActiveTab}
+              />
+
+              <ProfileSettingsModal
+                isOpen={settingsOpen}
+                onClose={() => setSettingsOpen(false)}
+                profile={profile}
+                userEmail={currentUser.email || ''}
+                rbac={rbac}
+                darkMode={darkMode}
+                onToggleDarkMode={() => setDarkMode((d) => !d)}
+                elderlyMode={elderlyMode}
+                onToggleElderlyMode={() => void handleToggleElderlyMode()}
+                rtSettings={rtSettings}
+                transactions={mergedTransactions}
+                bannerSlides={bannerSlides}
+                registryCount={registryEntries.length}
+                onOpenResidentRegistry={() => setRegistryOpen(true)}
+                onSaveProfile={handleSaveProfile}
+                onSaveRtSettings={handleSaveRtSettings}
+                onAddBannerSlide={handleAddBannerSlide}
+                onUpdateBannerSlide={handleUpdateBannerSlide}
+                onMoveBannerSlide={handleMoveBannerSlide}
+                onDeleteBannerSlide={handleDeleteBannerSlide}
+                onOpenTutorial={() => setTutorialOpen(true)}
+                onLogout={handleLogout}
+                sheetInfo={sheetInfo}
+                isSyncing={isSyncing}
+                isConnectingSheet={isConnectingSheet}
+                onSyncNow={() => void refreshSpreadsheetData(undefined, undefined, false)}
+                onCreateSpreadsheet={rbac.isFullAdmin ? handleCreateSpreadsheet : undefined}
+                onConnectSpreadsheetById={
+                  rbac.isFullAdmin ? handleConnectSpreadsheetById : undefined
+                }
+                onDisconnectGoogle={handleGoogleDisconnect}
+              />
+
+              {rbac.canManageResidents && (
+                <ResidentRegistryModal
+                  isOpen={registryOpen}
+                  onClose={() => setRegistryOpen(false)}
+                  canManageRbac={rbac.isFullAdmin}
+                  currentUserUid={currentUser.uid}
+                  registryEntries={registryEntries}
+                  existingResidents={residents}
+                  onAddEntry={handleAddRegistryEntry}
+                  onBulkImport={handleBulkImportRegistry}
+                  onSyncExistingResidents={handleSyncExistingResidentsToRegistry}
+                  onUpdateRbac={handleUpdateRegistryRbac}
+                  onResetClaim={handleResetRegistryClaim}
+                  onDeleteEntry={handleDeleteRegistryEntry}
+                />
+              )}
+            </div>
+          );
+        })()
       )}
-    </div>
+
+      <ConfirmActionModal
+        isOpen={Boolean(confirmPrompt)}
+        title={confirmPrompt?.title || ''}
+        description={confirmPrompt?.description || ''}
+        details={confirmPrompt?.details}
+        confirmLabel={confirmPrompt?.confirmLabel}
+        destructive={confirmPrompt?.destructive}
+        onConfirm={() => confirmPrompt?.resolve(true)}
+        onCancel={() => confirmPrompt?.resolve(false)}
+      />
+    </>
   );
 }

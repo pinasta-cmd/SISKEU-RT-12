@@ -1,5 +1,5 @@
-// Client-side AES-256-GCM encryption for sensitive PII and health profiles
-// Uses Web Crypto API (PBKDF2 + AES-GCM) before storing payloads in Firestore
+// Client-side AES-256-GCM encryption & PBKDF2 password hashing
+// Uses Web Crypto API (PBKDF2 + AES-GCM) before storing payloads in Google Spreadsheet
 
 const APP_PEPPER = 'KasWargaRT-AES256-Shield-2026';
 
@@ -19,6 +19,65 @@ function base64ToBuffer(base64: string): Uint8Array {
     bytes[i] = binary.charCodeAt(i);
   }
   return bytes;
+}
+
+export async function hashPassword(password: string): Promise<string> {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const enc = new TextEncoder();
+  const keyMaterial = await crypto.subtle.importKey(
+    'raw',
+    enc.encode(`${password}:${APP_PEPPER}`),
+    { name: 'PBKDF2' },
+    false,
+    ['deriveBits']
+  );
+  const derivedBits = await crypto.subtle.deriveBits(
+    {
+      name: 'PBKDF2',
+      salt: salt as unknown as BufferSource,
+      iterations: 100000,
+      hash: 'SHA-256',
+    },
+    keyMaterial,
+    256
+  );
+  return `v1:${bufferToBase64(salt)}:${bufferToBase64(derivedBits)}`;
+}
+
+export async function verifyPassword(password: string, storedHash: string): Promise<boolean> {
+  try {
+    const parts = storedHash.split(':');
+    if (parts.length !== 3 || parts[0] !== 'v1') return false;
+    const salt = base64ToBuffer(parts[1]);
+    const expected = base64ToBuffer(parts[2]);
+    const enc = new TextEncoder();
+    const keyMaterial = await crypto.subtle.importKey(
+      'raw',
+      enc.encode(`${password}:${APP_PEPPER}`),
+      { name: 'PBKDF2' },
+      false,
+      ['deriveBits']
+    );
+    const derivedBits = await crypto.subtle.deriveBits(
+      {
+        name: 'PBKDF2',
+        salt: salt as unknown as BufferSource,
+        iterations: 100000,
+        hash: 'SHA-256',
+      },
+      keyMaterial,
+      256
+    );
+    const actual = new Uint8Array(derivedBits);
+    if (actual.length !== expected.length) return false;
+    let diff = 0;
+    for (let i = 0; i < actual.length; i++) {
+      diff |= actual[i] ^ expected[i];
+    }
+    return diff === 0;
+  } catch {
+    return false;
+  }
 }
 
 async function deriveAesKey(uid: string, saltBytes: Uint8Array): Promise<CryptoKey> {
@@ -83,7 +142,7 @@ export async function decryptSensitiveJson<T>(uid: string, encryptedString: stri
   }
 }
 
-export function compressProofImage(file: File, maxDimension = 960, quality = 0.68): Promise<string> {
+export function compressProofImage(file: File, maxDimension = 840, quality = 0.65): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onerror = () => reject(new Error('Gagal membaca file foto.'));
@@ -110,12 +169,23 @@ export function compressProofImage(file: File, maxDimension = 960, quality = 0.6
           return;
         }
         ctx.drawImage(img, 0, 0, width, height);
-        const dataUrl = canvas.toDataURL('image/jpeg', quality);
-        if (dataUrl.length > 340000) {
-          resolve(canvas.toDataURL('image/jpeg', 0.48));
-        } else {
-          resolve(dataUrl);
+        const qualities = [quality, 0.52, 0.4, 0.3];
+        let dataUrl = canvas.toDataURL('image/jpeg', qualities[0]);
+        for (let i = 1; i < qualities.length && dataUrl.length > 210000; i++) {
+          dataUrl = canvas.toDataURL('image/jpeg', qualities[i]);
         }
+        if (dataUrl.length > 215000) {
+          const fallbackCanvas = document.createElement('canvas');
+          const scale = 0.68;
+          fallbackCanvas.width = Math.max(240, Math.round(width * scale));
+          fallbackCanvas.height = Math.max(180, Math.round(height * scale));
+          const fctx = fallbackCanvas.getContext('2d');
+          if (fctx) {
+            fctx.drawImage(canvas, 0, 0, fallbackCanvas.width, fallbackCanvas.height);
+            dataUrl = fallbackCanvas.toDataURL('image/jpeg', 0.45);
+          }
+        }
+        resolve(dataUrl);
       };
       img.src = String(reader.result);
     };
@@ -125,8 +195,8 @@ export function compressProofImage(file: File, maxDimension = 960, quality = 0.6
 
 export function compressBannerSlideImage(
   file: File,
-  maxDimension = 1280,
-  initialQuality = 0.78
+  maxDimension = 1080,
+  initialQuality = 0.72
 ): Promise<string> {
   return new Promise((resolve, reject) => {
     if (!file.type.startsWith('image/')) {
@@ -159,21 +229,21 @@ export function compressBannerSlideImage(
         }
         ctx.drawImage(img, 0, 0, width, height);
 
-        const qualities = [initialQuality, 0.65, 0.52, 0.4];
+        const qualities = [initialQuality, 0.58, 0.45, 0.35];
         let result = canvas.toDataURL('image/jpeg', qualities[0]);
-        for (let i = 1; i < qualities.length && result.length > 420000; i++) {
+        for (let i = 1; i < qualities.length && result.length > 250000; i++) {
           result = canvas.toDataURL('image/jpeg', qualities[i]);
         }
 
-        if (result.length > 440000) {
+        if (result.length > 260000) {
           const fallbackCanvas = document.createElement('canvas');
-          const scale = 0.72;
+          const scale = 0.68;
           fallbackCanvas.width = Math.max(320, Math.round(width * scale));
           fallbackCanvas.height = Math.max(200, Math.round(height * scale));
           const fctx = fallbackCanvas.getContext('2d');
           if (fctx) {
             fctx.drawImage(canvas, 0, 0, fallbackCanvas.width, fallbackCanvas.height);
-            result = fallbackCanvas.toDataURL('image/jpeg', 0.55);
+            result = fallbackCanvas.toDataURL('image/jpeg', 0.48);
           }
         }
         resolve(result);

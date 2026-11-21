@@ -2,25 +2,48 @@ import React, { useEffect, useMemo, useState } from 'react';
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react';
 import {
   Accessibility,
+  CheckCircle2,
   ChevronLeft,
   ChevronRight,
+  ExternalLink,
   Eye,
   EyeOff,
+  FileSpreadsheet,
+  Link2,
   Lock,
   LogIn,
   Moon,
   PhoneCall,
+  RefreshCw,
   ShieldCheck,
   Sun,
+  Unplug,
   User,
   UserPlus,
   WifiOff,
+  X,
 } from 'lucide-react';
 import { getOfflineSnapshot } from '../lib/offlineSync';
-import type { BannerSlide, LoginRole } from '../types';
+import type { BannerSlide, LoginRole, PengurusPosition, SheetDbInfo } from '../types';
+import { PENGURUS_POSITION_LABELS } from '../utils/rbac';
 import { PWAInstallButton } from './PWAInstallButton';
 
+interface RegisteredAccountNotice {
+  role: LoginRole;
+  username: string;
+  fullName: string;
+  pengurusPosition?: PengurusPosition;
+}
+
 interface LoginScreenProps {
+  googleConnected: boolean;
+  googleUserEmail: string | null;
+  sheetInfo: SheetDbInfo | null;
+  isConnectingSheet: boolean;
+  onGoogleConnect: () => Promise<void>;
+  onGoogleDisconnect: () => Promise<void>;
+  onConnectSpreadsheetById: (idOrUrl: string) => Promise<void>;
+  onSyncSpreadsheet: () => Promise<void>;
   onLoginWithCredentials: (data: {
     role: LoginRole;
     username: string;
@@ -32,7 +55,7 @@ interface LoginScreenProps {
     houseBlock: string;
     username: string;
     password: string;
-  }) => Promise<void>;
+  }) => Promise<RegisteredAccountNotice | null>;
   onGoogleAdminLogin: () => Promise<void>;
   isLoggingIn: boolean;
   loginError: string | null;
@@ -60,6 +83,14 @@ const DEFAULT_FALLBACK_SLIDE: SlideItem = {
 };
 
 export const LoginScreen: React.FC<LoginScreenProps> = ({
+  googleConnected,
+  googleUserEmail,
+  sheetInfo,
+  isConnectingSheet,
+  onGoogleConnect,
+  onGoogleDisconnect,
+  onConnectSpreadsheetById,
+  onSyncSpreadsheet,
   onLoginWithCredentials,
   onRegisterAccount,
   onGoogleAdminLogin,
@@ -87,6 +118,9 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
   const [confirmPassword, setConfirmPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
+  const [loginPopupData, setLoginPopupData] = useState<RegisteredAccountNotice | null>(null);
+  const [sheetInput, setSheetInput] = useState('');
+  const [showSheetSwitcher, setShowSheetSwitcher] = useState(false);
 
   const shouldReduceMotion = useReducedMotion();
   const offlineSnapshot = getOfflineSnapshot();
@@ -118,6 +152,22 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
     });
   };
 
+  const handleSubmitPopupLogin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!loginPopupData) return;
+    setLocalError(null);
+    onClearError();
+    if (!username.trim() || !password) {
+      setLocalError('Masukkan username dan sandi Anda.');
+      return;
+    }
+    await onLoginWithCredentials({
+      role: loginPopupData.role,
+      username: username.trim(),
+      password,
+    });
+  };
+
   const handleSubmitRegister = async (e: React.FormEvent) => {
     e.preventDefault();
     setLocalError(null);
@@ -138,13 +188,24 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
       setLocalError('Konfirmasi sandi tidak cocok.');
       return;
     }
-    await onRegisterAccount({
+    const result = await onRegisterAccount({
       role: selectedRole,
       fullName: fullName.trim(),
       houseBlock: houseBlock.trim(),
       username: username.trim(),
       password,
     });
+    if (result) {
+      setSelectedRole(result.role);
+      setAuthMode('login');
+      setUsername(result.username);
+      setPassword('');
+      setConfirmPassword('');
+      setFullName('');
+      setHouseBlock('');
+      setLocalError(null);
+      setLoginPopupData(result);
+    }
   };
 
   const slides: SlideItem[] = useMemo(() => {
@@ -353,8 +414,155 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
               Pantau kas RT secara terbuka, iuran bulanan, cek laporan bulanan, dan akses layanan darurat.
             </p>
 
+            {/* Google Spreadsheet Database Connection Card */}
+            <div className="mt-5 rounded-2xl bg-emerald-50/70 dark:bg-emerald-950/30 border border-emerald-200 dark:border-emerald-900 p-4 space-y-3">
+              <div className="flex items-start justify-between gap-2">
+                <div className="flex items-start gap-2.5 min-w-0">
+                  <div className="w-8 h-8 rounded-xl bg-emerald-700 text-white flex items-center justify-center shrink-0">
+                    <FileSpreadsheet className="w-4 h-4" />
+                  </div>
+                  <div className="min-w-0">
+                    <p className="text-xs font-extrabold text-slate-900 dark:text-slate-100">
+                      Database Google Spreadsheet
+                    </p>
+                    <p className="text-[11px] text-slate-600 dark:text-slate-300 truncate">
+                      {!googleConnected
+                        ? 'Hubungkan akun Google untuk membaca & menyimpan data RT'
+                        : sheetInfo
+                        ? `${sheetInfo.spreadsheetTitle} · ${googleUserEmail || 'Terhubung'}`
+                        : `Terhubung sebagai ${googleUserEmail || 'Google'} · Pilih Spreadsheet`}
+                    </p>
+                  </div>
+                </div>
+                {googleConnected && (
+                  <button
+                    type="button"
+                    onClick={() => void onGoogleDisconnect()}
+                    title="Putuskan koneksi Google"
+                    aria-label="Putuskan koneksi Google"
+                    className="min-h-[34px] px-2 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-[11px] font-semibold text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 inline-flex items-center gap-1 shrink-0 cursor-pointer"
+                  >
+                    <Unplug className="w-3 h-3" />
+                    <span>Keluar</span>
+                  </button>
+                )}
+              </div>
+
+              {!googleConnected ? (
+                <button
+                  type="button"
+                  disabled={isConnectingSheet || !isOnline}
+                  onClick={() => void onGoogleConnect()}
+                  className="gsi-material-button"
+                >
+                  <div className="gsi-material-button-state" />
+                  <div className="gsi-material-button-content-wrapper">
+                    <div className="gsi-material-button-icon">
+                      <svg
+                        version="1.1"
+                        xmlns="http://www.w3.org/2000/svg"
+                        viewBox="0 0 48 48"
+                        xmlnsXlink="http://www.w3.org/1999/xlink"
+                        style={{ display: 'block' }}
+                      >
+                        <path
+                          fill="#EA4335"
+                          d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"
+                        />
+                        <path
+                          fill="#4285F4"
+                          d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"
+                        />
+                        <path
+                          fill="#FBBC05"
+                          d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"
+                        />
+                        <path
+                          fill="#34A853"
+                          d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"
+                        />
+                        <path fill="none" d="M0 0h48v48H0z" />
+                      </svg>
+                    </div>
+                    <span className="gsi-material-button-contents">
+                      {isConnectingSheet ? 'Menghubungkan Google...' : 'Sign in with Google'}
+                    </span>
+                    <span style={{ display: 'none' }}>Sign in with Google</span>
+                  </div>
+                </button>
+              ) : !sheetInfo || showSheetSwitcher ? (
+                <div className="space-y-2.5 pt-1">
+                  {!sheetInfo && (
+                    <div className="rounded-xl bg-amber-50/90 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800 px-3 py-2 text-[11px] text-amber-900 dark:text-amber-200 leading-relaxed">
+                      Belum ada database Google Spreadsheet. Tempel URL/ID Spreadsheet RT yang sudah ada, atau masuk sebagai <strong>Admin Google</strong> di bawah untuk membuat database baru setelah login.
+                    </div>
+                  )}
+
+                  <div className="flex gap-1.5">
+                    <input
+                      type="text"
+                      value={sheetInput}
+                      onChange={(e) => setSheetInput(e.target.value)}
+                      placeholder="Atau tempel URL / ID Google Spreadsheet..."
+                      className="flex-1 min-w-0 min-h-[38px] px-3 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs"
+                    />
+                    <button
+                      type="button"
+                      disabled={isConnectingSheet || !sheetInput.trim() || !isOnline}
+                      onClick={async () => {
+                        await onConnectSpreadsheetById(sheetInput);
+                        setSheetInput('');
+                        setShowSheetSwitcher(false);
+                      }}
+                      className="min-h-[38px] px-3 rounded-xl bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900 text-xs font-bold inline-flex items-center gap-1 shrink-0 disabled:opacity-50 cursor-pointer"
+                    >
+                      <Link2 className="w-3.5 h-3.5" />
+                      <span>Pakai</span>
+                    </button>
+                  </div>
+                  {sheetInfo && (
+                    <button
+                      type="button"
+                      onClick={() => setShowSheetSwitcher(false)}
+                      className="text-[11px] font-semibold text-slate-600 dark:text-slate-400 hover:underline cursor-pointer"
+                    >
+                      Batal ganti spreadsheet
+                    </button>
+                  )}
+                </div>
+              ) : (
+                <div className="flex flex-wrap items-center gap-2 pt-0.5">
+                  <a
+                    href={sheetInfo.spreadsheetUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="min-h-[32px] px-2.5 rounded-lg bg-white dark:bg-slate-900 border border-emerald-200 dark:border-emerald-800 text-[11px] font-semibold text-emerald-700 dark:text-emerald-300 inline-flex items-center gap-1 hover:bg-emerald-50 dark:hover:bg-emerald-950/50"
+                  >
+                    <span>Buka Sheet</span>
+                    <ExternalLink className="w-3 h-3" />
+                  </a>
+                  <button
+                    type="button"
+                    disabled={isConnectingSheet}
+                    onClick={() => void onSyncSpreadsheet()}
+                    className="min-h-[32px] px-2.5 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-[11px] font-semibold text-slate-700 dark:text-slate-200 inline-flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                  >
+                    <RefreshCw className={`w-3 h-3 ${isConnectingSheet ? 'animate-spin' : ''}`} />
+                    <span>Muat Ulang</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowSheetSwitcher(true)}
+                    className="min-h-[32px] px-2.5 rounded-lg bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-700 text-[11px] font-semibold text-slate-700 dark:text-slate-200 cursor-pointer"
+                  >
+                    Ganti Sheet
+                  </button>
+                </div>
+              )}
+            </div>
+
             {/* Auth Box */}
-            <div className="mt-6 rounded-2xl bg-slate-50 dark:bg-slate-950/70 border border-slate-200/80 dark:border-slate-800 p-5 space-y-4">
+            <div className="mt-4 rounded-2xl bg-slate-50 dark:bg-slate-950/70 border border-slate-200/80 dark:border-slate-800 p-5 space-y-4">
               {/* Role Selector: Warga vs Pengurus */}
               <div>
                 <p className="text-xs font-bold uppercase tracking-wider text-slate-500 dark:text-slate-400 mb-2">
@@ -506,7 +714,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
                   {selectedRole === 'pengurus' && (
                     <div className="pt-3 border-t border-slate-200/80 dark:border-slate-800 space-y-2.5">
                       <p className="text-[11px] text-center text-slate-500 dark:text-slate-400">
-                        Atau masuk khusus Admin Utama Google untuk kelola Database Warga
+                        Atau masuk langsung sebagai Admin Utama Google (tanpa penyesuaian data, dapat membuat database setelah login)
                       </p>
                       <button
                         type="button"
@@ -663,7 +871,7 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
               )}
 
               <p className="text-[11px] text-center text-slate-500 dark:text-slate-400">
-                Auth Terverifikasi · Enkripsi AES-256-GCM · Sinkronisasi Offline
+                Database Google Spreadsheet · Enkripsi AES-256-GCM · Sinkronisasi Offline
               </p>
             </div>
 
@@ -741,6 +949,157 @@ export const LoginScreen: React.FC<LoginScreenProps> = ({
           </div>
         </section>
       </main>
+
+      {/* Role-Specific Login Popup After Registration */}
+      {loginPopupData && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label={
+            loginPopupData.role === 'pengurus' ? 'Form Login Pengurus' : 'Form Login Warga'
+          }
+          onClick={() => {
+            setLoginPopupData(null);
+            setLocalError(null);
+            onClearError();
+          }}
+          className="fixed inset-0 z-50 flex items-end sm:items-center justify-center bg-black/60 backdrop-blur-xs sm:p-4"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="w-full sm:max-w-md rounded-t-3xl sm:rounded-3xl bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 shadow-2xl overflow-hidden"
+          >
+            <div className="sm:hidden pt-3 pb-1 flex justify-center">
+              <span className="w-10 h-1.5 rounded-full bg-slate-300 dark:bg-slate-700" />
+            </div>
+
+            <div className="px-6 py-4 border-b border-slate-100 dark:border-slate-800 flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2.5">
+                <div
+                  className={`w-10 h-10 rounded-xl flex items-center justify-center shrink-0 ${
+                    loginPopupData.role === 'pengurus'
+                      ? 'bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-400'
+                      : 'bg-sky-50 dark:bg-sky-950/60 text-sky-700 dark:text-sky-400'
+                  }`}
+                >
+                  {loginPopupData.role === 'pengurus' ? (
+                    <ShieldCheck className="w-5 h-5" />
+                  ) : (
+                    <User className="w-5 h-5" />
+                  )}
+                </div>
+                <div>
+                  <h2 className="text-base sm:text-lg font-extrabold text-slate-900 dark:text-slate-100">
+                    {loginPopupData.role === 'pengurus'
+                      ? 'Form Login Pengurus'
+                      : 'Form Login Warga'}
+                  </h2>
+                  <p className="text-xs text-slate-500 dark:text-slate-400">
+                    {loginPopupData.role === 'pengurus' && loginPopupData.pengurusPosition
+                      ? `Jabatan: ${PENGURUS_POSITION_LABELS[loginPopupData.pengurusPosition]}`
+                      : loginPopupData.role === 'pengurus'
+                      ? 'Akses Pengurus RT'
+                      : 'Akses Warga RT 12 / RW 20'}
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setLoginPopupData(null);
+                  setLocalError(null);
+                  onClearError();
+                }}
+                aria-label="Tutup form login"
+                className="min-h-[44px] min-w-[44px] flex items-center justify-center rounded-xl text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <form onSubmit={(e) => void handleSubmitPopupLogin(e)} className="p-6 space-y-4">
+              <div className="rounded-2xl bg-emerald-50 dark:bg-emerald-950/40 border border-emerald-200 dark:border-emerald-800 p-3.5 flex items-start gap-2.5">
+                <CheckCircle2 className="w-4 h-4 text-emerald-700 dark:text-emerald-400 shrink-0 mt-0.5" />
+                <div className="text-xs text-emerald-900 dark:text-emerald-200 leading-relaxed">
+                  <p className="font-bold">Pendaftaran Akun Berhasil!</p>
+                  <p className="mt-0.5">
+                    Akun <strong>{loginPopupData.fullName}</strong> terdaftar sebagai{' '}
+                    <strong>
+                      {loginPopupData.role === 'pengurus' ? 'Pengurus' : 'Warga'}
+                    </strong>
+                    . Silakan masuk dengan username dan sandi Anda.
+                  </p>
+                </div>
+              </div>
+
+              {(localError || loginError) && (
+                <div
+                  role="alert"
+                  className="rounded-xl bg-red-50 dark:bg-red-950/50 border border-red-200 dark:border-red-800 p-3.5 text-xs font-medium text-red-800 dark:text-red-200 leading-relaxed"
+                >
+                  {localError || loginError}
+                </div>
+              )}
+
+              <div>
+                <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1">
+                  Username ({loginPopupData.role === 'pengurus' ? 'Pengurus' : 'Warga'})
+                </label>
+                <input
+                  type="text"
+                  required
+                  autoComplete="username"
+                  placeholder="Masukkan Username"
+                  value={username}
+                  onChange={(e) => setUsername(e.target.value)}
+                  className="w-full min-h-[44px] px-3.5 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-sm"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1">
+                  Sandi
+                </label>
+                <div className="relative">
+                  <input
+                    type={showPassword ? 'text' : 'password'}
+                    required
+                    autoFocus
+                    autoComplete="current-password"
+                    placeholder="Masukkan sandi Anda"
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    className="w-full min-h-[44px] pl-3.5 pr-11 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-950 text-sm"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowPassword((v) => !v)}
+                    aria-label={showPassword ? 'Sembunyikan sandi' : 'Lihat sandi'}
+                    className="absolute right-1 top-1/2 -translate-y-1/2 min-h-[38px] min-w-[38px] flex items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800 cursor-pointer"
+                  >
+                    {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  </button>
+                </div>
+              </div>
+
+              <button
+                type="submit"
+                disabled={isLoggingIn || !isOnline}
+                className="w-full min-h-[46px] px-4 rounded-xl bg-emerald-700 hover:bg-emerald-800 active:scale-[0.99] disabled:opacity-50 text-white font-bold text-sm flex items-center justify-center gap-2 shadow-sm transition-all cursor-pointer"
+              >
+                <LogIn className="w-4 h-4 shrink-0" />
+                <span>
+                  {isLoggingIn
+                    ? 'Memeriksa Akun...'
+                    : `Masuk sebagai ${
+                        loginPopupData.role === 'pengurus' ? 'Pengurus' : 'Warga'
+                      }`}
+                </span>
+              </button>
+            </form>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import {
   Bell,
   CheckCheck,
+  RefreshCw,
   Settings,
   X,
 } from 'lucide-react';
@@ -16,6 +17,8 @@ interface HeaderNavProps {
   onMarkAllRead: () => Promise<void>;
   onOpenSettings: () => void;
   activeEmergencyCount: number;
+  onSyncSheets?: () => void;
+  isSyncing?: boolean;
 }
 
 const NAV_ITEMS: { id: AppTab; label: string }[] = [
@@ -34,6 +37,8 @@ export const HeaderNav: React.FC<HeaderNavProps> = ({
   onMarkAllRead,
   onOpenSettings,
   activeEmergencyCount,
+  onSyncSheets,
+  isSyncing = false,
 }) => {
   const [notifOpen, setNotifOpen] = useState(false);
   const unreadCount = notifications.filter((n) => !n.isRead).length;
@@ -75,8 +80,20 @@ export const HeaderNav: React.FC<HeaderNavProps> = ({
             })}
           </nav>
 
-          {/* Zone 3: Single Action Cluster (Notifications + Account/Mode) */}
+          {/* Zone 3: Single Action Cluster (Sync + Notifications + Account/Mode) */}
           <div className="flex items-center gap-2 shrink-0">
+            {onSyncSheets && (
+              <button
+                type="button"
+                onClick={onSyncSheets}
+                disabled={isSyncing}
+                aria-label="Sinkronkan Google Spreadsheet"
+                title="Sinkronkan Google Spreadsheet"
+                className="min-h-[44px] min-w-[44px] flex items-center justify-center rounded-xl text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors cursor-pointer disabled:opacity-50"
+              >
+                <RefreshCw className={`w-4 h-4 ${isSyncing ? 'animate-spin text-emerald-600' : ''}`} />
+              </button>
+            )}
             <button
               type="button"
               onClick={() => setNotifOpen(true)}

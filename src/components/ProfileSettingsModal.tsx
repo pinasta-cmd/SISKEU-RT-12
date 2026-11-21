@@ -7,11 +7,16 @@ import {
   BookOpen,
   Check,
   Database,
+  ExternalLink,
+  FileSpreadsheet,
+  FolderPlus,
   ImagePlus,
   Images,
+  Link2,
   LogOut,
   Moon,
   Pencil,
+  RefreshCw,
   ShieldCheck,
   Sun,
   Trash2,
@@ -27,6 +32,7 @@ import type {
   ResidentPublic,
   ResidentStatus,
   RtSettings,
+  SheetDbInfo,
 } from '../types';
 import {
   FAMILY_STATUS_LABELS,
@@ -76,6 +82,13 @@ interface ProfileSettingsModalProps {
   onDeleteBannerSlide?: (id: string) => Promise<void>;
   onOpenTutorial: () => void;
   onLogout: () => Promise<void>;
+  sheetInfo?: SheetDbInfo | null;
+  isSyncing?: boolean;
+  isConnectingSheet?: boolean;
+  onSyncNow?: () => void;
+  onCreateSpreadsheet?: () => Promise<void>;
+  onConnectSpreadsheetById?: (idOrUrl: string) => Promise<void>;
+  onDisconnectGoogle?: () => Promise<void>;
 }
 
 interface PendingLocalSlide {
@@ -106,6 +119,13 @@ export const ProfileSettingsModal: React.FC<ProfileSettingsModalProps> = ({
   onDeleteBannerSlide,
   onOpenTutorial,
   onLogout,
+  sheetInfo,
+  isSyncing = false,
+  isConnectingSheet = false,
+  onSyncNow,
+  onCreateSpreadsheet,
+  onConnectSpreadsheetById,
+  onDisconnectGoogle,
 }) => {
   const [displayName, setDisplayName] = useState(profile.displayName);
   const [houseBlock, setHouseBlock] = useState(profile.houseBlock);
@@ -140,6 +160,7 @@ export const ProfileSettingsModal: React.FC<ProfileSettingsModalProps> = ({
   const [editingSlideId, setEditingSlideId] = useState<string | null>(null);
   const [editTitle, setEditTitle] = useState('');
   const [editSubtitle, setEditSubtitle] = useState('');
+  const [sheetIdInput, setSheetIdInput] = useState('');
 
   useEffect(() => {
     if (isOpen) {
@@ -540,9 +561,6 @@ export const ProfileSettingsModal: React.FC<ProfileSettingsModalProps> = ({
                 >
                   <option value="tetap">Warga Tetap</option>
                   <option value="kontrak">Warga Kontrak/Sewa</option>
-                  {(rbac.isPengurus || residentStatus === 'pengurus') && (
-                    <option value="pengurus">Pengurus RT</option>
-                  )}
                 </select>
               </div>
               <div>
@@ -995,6 +1013,108 @@ export const ProfileSettingsModal: React.FC<ProfileSettingsModalProps> = ({
                   Belum ada foto kustom. Saat ini halaman login menampilkan banner default RT.
                 </p>
               )}
+            </div>
+          )}
+
+          {(sheetInfo || rbac.isFullAdmin) && (
+            <div className="pt-5 border-t border-slate-100 dark:border-slate-800 space-y-3">
+              <div className="rounded-2xl bg-slate-50 dark:bg-slate-950/60 border border-slate-200 dark:border-slate-800 p-4 space-y-3">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="flex items-start gap-2.5 min-w-0">
+                    <div className="w-9 h-9 rounded-xl bg-emerald-100 dark:bg-emerald-950 text-emerald-700 dark:text-emerald-400 flex items-center justify-center shrink-0">
+                      <FileSpreadsheet className="w-4 h-4" />
+                    </div>
+                    <div className="min-w-0">
+                      <p className="text-xs font-bold text-slate-900 dark:text-slate-100 truncate">
+                        Database Google Spreadsheet
+                      </p>
+                      <p className="text-[11px] text-slate-600 dark:text-slate-400 truncate">
+                        {sheetInfo
+                          ? `${sheetInfo.spreadsheetTitle} (${sheetInfo.spreadsheetId.slice(0, 12)}…)`
+                          : 'Belum ada database Google Spreadsheet terhubung'}
+                      </p>
+                    </div>
+                  </div>
+                  {sheetInfo && (
+                    <a
+                      href={sheetInfo.spreadsheetUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="min-h-[36px] px-3 rounded-lg border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs font-semibold text-emerald-700 dark:text-emerald-400 inline-flex items-center gap-1.5 shrink-0 hover:bg-slate-100 dark:hover:bg-slate-800"
+                    >
+                      <span>Buka Sheet</span>
+                      <ExternalLink className="w-3.5 h-3.5" />
+                    </a>
+                  )}
+                </div>
+
+                {rbac.isFullAdmin && (onCreateSpreadsheet || onConnectSpreadsheetById) && (
+                  <div className="space-y-2.5 pt-1 border-t border-slate-200/70 dark:border-slate-800">
+                    {onCreateSpreadsheet && (
+                      <button
+                        type="button"
+                        disabled={isConnectingSheet}
+                        onClick={() => void onCreateSpreadsheet()}
+                        className="w-full min-h-[42px] px-4 rounded-xl bg-emerald-700 hover:bg-emerald-800 disabled:opacity-50 text-white text-xs font-bold inline-flex items-center justify-center gap-2 cursor-pointer"
+                      >
+                        <FolderPlus className="w-4 h-4 shrink-0" />
+                        <span>
+                          {isConnectingSheet
+                            ? 'Menyiapkan Spreadsheet...'
+                            : 'Buat Database Spreadsheet Baru'}
+                        </span>
+                      </button>
+                    )}
+
+                    {onConnectSpreadsheetById && (
+                      <div className="flex gap-2">
+                        <input
+                          type="text"
+                          value={sheetIdInput}
+                          onChange={(e) => setSheetIdInput(e.target.value)}
+                          placeholder="Tempel URL / ID Google Spreadsheet..."
+                          className="flex-1 min-w-0 min-h-[40px] px-3 rounded-xl border border-slate-300 dark:border-slate-700 bg-white dark:bg-slate-900 text-xs"
+                        />
+                        <button
+                          type="button"
+                          disabled={isConnectingSheet || !sheetIdInput.trim()}
+                          onClick={async () => {
+                            await onConnectSpreadsheetById(sheetIdInput);
+                            setSheetIdInput('');
+                          }}
+                          className="min-h-[40px] px-3.5 rounded-xl bg-slate-900 dark:bg-slate-100 text-white dark:text-slate-900 text-xs font-bold inline-flex items-center gap-1.5 shrink-0 disabled:opacity-50 cursor-pointer"
+                        >
+                          <Link2 className="w-3.5 h-3.5" />
+                          <span>Hubungkan</span>
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                <div className="flex flex-wrap items-center gap-2">
+                  {sheetInfo && onSyncNow && (
+                    <button
+                      type="button"
+                      disabled={isSyncing}
+                      onClick={onSyncNow}
+                      className="min-h-[38px] px-3.5 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 hover:bg-slate-100 dark:hover:bg-slate-800 text-xs font-semibold inline-flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+                    >
+                      <RefreshCw className={`w-3.5 h-3.5 ${isSyncing ? 'animate-spin' : ''}`} />
+                      <span>{isSyncing ? 'Menyinkronkan...' : 'Sinkronkan Spreadsheet'}</span>
+                    </button>
+                  )}
+                  {onDisconnectGoogle && (
+                    <button
+                      type="button"
+                      onClick={() => void onDisconnectGoogle()}
+                      className="min-h-[38px] px-3.5 rounded-xl border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 hover:bg-slate-100 dark:hover:bg-slate-800 text-xs font-semibold text-slate-600 dark:text-slate-300 cursor-pointer"
+                    >
+                      Ganti / Putuskan Google
+                    </button>
+                  )}
+                </div>
+              </div>
             </div>
           )}
 

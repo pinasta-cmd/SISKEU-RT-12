@@ -97,7 +97,23 @@ export interface UserAccountLookup {
   username: string;
   role: LoginRole;
   registryId: string;
+  passwordHash?: string;
   createdAt?: unknown;
+}
+
+export interface AppUserSession {
+  uid: string;
+  email: string;
+  displayName: string;
+  username?: string;
+  role: LoginRole;
+}
+
+export interface SheetDbInfo {
+  spreadsheetId: string;
+  spreadsheetTitle: string;
+  spreadsheetUrl: string;
+  lastSyncedAtIso?: string;
 }
 
 export interface PrivateProfileData {
@@ -114,6 +130,17 @@ export interface PrivateHealthData {
   medications: string;
   insuranceProvider: string;
   shareInEmergency: boolean;
+}
+
+export interface PrivateDataRecord {
+  id: string;
+  uid: string;
+  docType: 'profile' | 'health';
+  encryptedPayload: string;
+  encryptionAlg: string;
+  shareInEmergency?: boolean;
+  emergencySummary?: string;
+  updatedAt?: string;
 }
 
 export interface KasTransaction {
