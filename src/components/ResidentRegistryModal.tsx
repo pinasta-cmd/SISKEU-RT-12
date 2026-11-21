@@ -481,7 +481,7 @@ export const ResidentRegistryModal: React.FC<ResidentRegistryModalProps> = ({
                   <option value="tetap">Warga Tetap</option>
                   <option value="kontrak">Warga Kontrak</option>
                   {canManageRbac && role === 'pengurus' && (
-                    <option value="pengurus">Pengurus RT</option>
+                    <option value="pengurus"></option>
                   )}
                 </select>
               </div>
